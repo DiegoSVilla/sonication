@@ -9,8 +9,7 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable, Optional
 
-from . import analysis, clients, config, db, events
-from .monitor import monitor
+from . import clients, config, db, events
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -172,15 +171,12 @@ class CallPipeline:
             "t_tts_req": tts_start_t,
             "t_tts_audio": gen_first_audio_t,
         })
-        # The browser reports the channel playback-start on the first audio chunk,
-        # which lands before generation finishes, so it is usually available here.
         turn_row = db.get_turn_by_index(self.call_id, idx)
         if turn_row and turn_row.get("first_audio_channel_t_ms") is not None:
             marks["t_channel"] = turn_row["first_audio_channel_t_ms"]
-        timing = {"marks": marks, "pings": monitor.snapshot()}
+
+        timing = {"marks": marks}
         db.update_turn(turn_id, timing_json=json.dumps(timing))
-        waterfall = analysis.compute_waterfall(timing)
-        await self._emit({"type": "timing", "turn_index": idx, "waterfall": waterfall})
 
         await self._emit({"type": "turn_done", "turn_index": idx, "metrics": metrics})
         return {"turn_id": turn_id, "assistant_text": state["assistant_text"],
