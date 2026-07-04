@@ -1,0 +1,23 @@
+INFO:     Started server process [2424401]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8093 (Press CTRL+C to quit)
+>>> model discovery: {'llm': {'model': 'LeaderboardModel1/Agents-A1-AutoRound-W4A16-RTN', 'context_tokens': 196608}, 'stt': {'model': 'Qwen/Qwen3-ASR-0.6B'}, 'tts': {'model': 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice'}}
+INFO:     127.0.0.1:49878 - "GET /api/ping HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49880 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET /static/app.js HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "WebSocket /ws" [accepted]
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "WebSocket /ws" [accepted]
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "WebSocket /ws" [accepted]
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "WebSocket /ws" [accepted]
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "GET / HTTP/1.1" 200 OK
+INFO:     2804:7f0:bbc2:5743:a048:30e8:3a8:5a61:0 - "WebSocket /ws" [accepted]
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [2424401]
