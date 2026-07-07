@@ -16,7 +16,9 @@ import logging
 import uuid
 from typing import Dict, List, Optional, Tuple, Any
 
-from .events import PipeEvent
+from .events import (
+    PipeEvent, NodeEvent, PhaseBoundary, NodeStageRecord, InterStageEvent,
+)
 from .db import log_pipe_event
 from .node_types import PipelineType, NodeConfigLabel
 
@@ -176,7 +178,7 @@ class Turn:
             "turn_start", entry_point, self.turn_id, local_offset_ms=0.0))
 
         # Also record pipeline_start as inter-stage event
-        self.inter_stage_events.append(object(
+        self.inter_stage_events.append(InterStageEvent(
             event_type="turn_start",
             wallclock_ms=time.time() * 1000,
             local_offset_ms=self._now(),
@@ -211,7 +213,7 @@ class Turn:
         node._stage_id = stage_id  # assign for later reference
 
         # Create NodeStageRecord
-        stage_record = object(
+        stage_record = NodeStageRecord(
             stage_id=stage_id,
             node_name=node_name,
             node_class=node.node_class,
@@ -305,7 +307,7 @@ class Turn:
 
         if node_name == "stt":
             if kind == "transcript" and self.boundaries.t_stt_req is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_stt_req",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -314,7 +316,7 @@ class Turn:
                 self.boundaries.t_stt_req = pb
                 stage_record.timing["t_stt_req"] = now_ms
             if kind == "done" and self.boundaries.t_stt_resp is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_stt_resp",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -326,7 +328,7 @@ class Turn:
 
         elif node_name == "llm":
             if kind == "token" and self.boundaries.t_llm_req is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_llm_req",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -335,7 +337,7 @@ class Turn:
                 self.boundaries.t_llm_req = pb
                 stage_record.timing["t_llm_req"] = now_ms
             if kind == "token" and self.boundaries.t_llm_ttft is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_llm_ttft",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -345,7 +347,7 @@ class Turn:
                 stage_record.timing["t_llm_ttft"] = now_ms
                 self.llm_ttft_ms = self._now()
             if kind == "done" and self.boundaries.t_llm_resp is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_llm_resp",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -356,7 +358,7 @@ class Turn:
 
         elif node_name == "tts":
             if kind == "audio" and self.boundaries.t_tts_req is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_tts_req",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -365,7 +367,7 @@ class Turn:
                 self.boundaries.t_tts_req = pb
                 stage_record.timing["t_tts_req"] = now_ms
             if kind == "audio" and self.boundaries.t_tts_ttfb is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_tts_ttfb",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -375,7 +377,7 @@ class Turn:
                 stage_record.timing["t_tts_ttfb"] = now_ms
                 self.tts_start_ms = self._now()
             if kind == "done" and self.boundaries.t_tts_resp is None:
-                pb = object(
+                pb = PhaseBoundary(
                     name="t_tts_resp",
                     wallclock_ms=now_ms,
                     local_offset_ms=self._now(),
@@ -432,7 +434,7 @@ class Turn:
         ts = time.time() * 1000
         now = self._now()
 
-        self.inter_stage_events.append(object(
+        self.inter_stage_events.append(InterStageEvent(
             event_type="phrase_gate",
             wallclock_ms=ts,
             local_offset_ms=now,
