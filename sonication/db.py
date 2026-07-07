@@ -84,6 +84,68 @@ CREATE TABLE IF NOT EXISTS session_state (
 CREATE INDEX IF NOT EXISTS idx_events_call ON events(call_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_call ON turns(call_id, turn_index);
 CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id);
+
+-- Node stages: one row per node invocation on a turn
+CREATE TABLE IF NOT EXISTS node_stages (
+    stage_id            TEXT PRIMARY KEY,
+    turn_id             TEXT NOT NULL,
+    session_id          TEXT,
+    conversation_id     TEXT,
+    node_name           TEXT NOT NULL,
+    node_class          TEXT NOT NULL,
+    config_label        TEXT NOT NULL,
+    start_wall_ms       REAL NOT NULL,
+    end_wall_ms         REAL,
+    timing_json         TEXT,
+    summary_json        TEXT,
+    FOREIGN KEY(turn_id) REFERENCES turns(id)
+);
+
+-- Pipe events (extended)
+CREATE TABLE IF NOT EXISTS pipe_events (
+    event_id                  TEXT PRIMARY KEY,
+    type                      TEXT,
+    node_name                 TEXT,
+    turn_id                   TEXT,
+    timestamp_wallclock_ms    REAL,
+    timestamp_local_offset    REAL,
+    payload_json              TEXT,
+    parent_event_id           TEXT,
+    stage_id                  TEXT,
+    seq                       INTEGER
+);
+
+-- Inter-stage events
+CREATE TABLE IF NOT EXISTS inter_stage_events (
+    event_id            TEXT PRIMARY KEY,
+    turn_id             TEXT NOT NULL,
+    session_id          TEXT,
+    conversation_id     TEXT,
+    event_type          TEXT NOT NULL,
+    wallclock_ms        REAL NOT NULL,
+    local_offset_ms     REAL,
+    seq                 INTEGER,
+    from_stage_id       TEXT,
+    to_stage_id         TEXT,
+    payload_json        TEXT NOT NULL,
+    UNIQUE(turn_id, seq)
+);
+
+-- Keep-alive pings
+CREATE TABLE IF NOT EXISTS keep_warm_pings (
+    ping_id             TEXT PRIMARY KEY,
+    node_name           TEXT NOT NULL,
+    wallclock_ms        REAL NOT NULL,
+    rtt_ms              REAL NOT NULL,
+    parent_turn_id      TEXT,
+    FOREIGN KEY(parent_turn_id) REFERENCES turns(id)
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_pipe_events_stage ON pipe_events(stage_id);
+CREATE INDEX IF NOT EXISTS idx_inter_stage_turn ON inter_stage_events(turn_id, seq);
+CREATE INDEX IF NOT EXISTS idx_node_stages_turn ON node_stages(turn_id);
+CREATE INDEX IF NOT EXISTS idx_node_stages_config ON node_stages(config_label);
 """
 
 
@@ -102,6 +164,15 @@ def get_conn() -> sqlite3.Connection:
         ):
             try:
                 _conn.execute(f"ALTER TABLE turns ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # Migrate pipe_events for stage_id/seq support
+        for col, coltype in (
+            ("stage_id", "TEXT"),
+            ("seq", "INTEGER"),
+        ):
+            try:
+                _conn.execute(f"ALTER TABLE pipe_events ADD COLUMN {col} {coltype}")
             except sqlite3.OperationalError:
                 pass  # column already exists
         _conn.commit()
@@ -234,6 +305,30 @@ def insert_event(event: dict[str, Any]) -> None:
         conn.commit()
 
 
+def log_pipe_event(event: dict[str, Any]) -> None:
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO pipe_events "
+            "(event_id, type, node_name, turn_id, timestamp_wallclock_ms, "
+            "timestamp_local_offset, payload_json, parent_event_id, stage_id, seq) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                event["event_id"],
+                event["type"],
+                event["node_name"],
+                event["turn_id"],
+                event["timestamp_wallclock_ms"],
+                event["timestamp_local_offset"],
+                json.dumps(event["payload"]),
+                event.get("parent_event_id"),
+                event.get("stage_id"),
+                event.get("seq"),
+            ),
+        )
+        conn.commit()
+
+
 # ---- read helpers for the analysis space and JSON export ----
 
 def _rows(sql: str, args: tuple = ()) -> list[dict[str, Any]]:
@@ -271,3 +366,133 @@ def get_events(call_id: str) -> list[dict[str, Any]]:
     for r in rows:
         r["payload"] = json.loads(r.pop("payload_json") or "{}")
     return rows
+
+
+def log_node_event(event: dict[str, Any]) -> None:
+    """Save a NodeEvent to the pipe_events table with stage_id and seq."""
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            """
+            INSERT INTO pipe_events(event_id, type, node_name, turn_id, timestamp_wallclock_ms,
+                                    timestamp_local_offset, payload_json, parent_event_id, stage_id, seq)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.get("event_id"),
+                event.get("event_type") or event.get("type"),
+                event.get("node_name"),
+                event.get("turn_id"),
+                event.get("wallclock_ms") or event.get("timestamp_wallclock_ms"),
+                event.get("local_offset_ms") or event.get("timestamp_local_offset"),
+                json.dumps(event.get("payload", {})),
+                event.get("parent_event_id"),
+                event.get("stage_id"),
+                event.get("seq"),
+            ),
+        )
+        conn.commit()
+
+
+def insert_inter_stage_event(event: dict[str, Any]) -> None:
+    """Save an InterStageEvent to the inter_stage_events table."""
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            """
+            INSERT INTO inter_stage_events(event_id, turn_id, session_id, conversation_id,
+                                          event_type, wallclock_ms, local_offset_ms, seq,
+                                          from_stage_id, to_stage_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.get("event_id"),
+                event.get("turn_id"),
+                event.get("session_id"),
+                event.get("conversation_id"),
+                event.get("event_type"),
+                event.get("wallclock_ms"),
+                event.get("local_offset_ms"),
+                event.get("seq"),
+                event.get("from_stage_id"),
+                event.get("to_stage_id"),
+                json.dumps(event.get("payload", {})),
+            ),
+        )
+        conn.commit()
+
+
+def log_keep_warm_ping(
+    node_name: str, wallclock_ms: float, rtt_ms: float, parent_turn_id: str = None
+) -> None:
+    """Save a keepalive ping to the keep_warm_pings table."""
+    import uuid
+    ping_id = str(uuid.uuid4())
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO keep_warm_pings(ping_id, node_name, wallclock_ms, rtt_ms, parent_turn_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ping_id, node_name, wallclock_ms, rtt_ms, parent_turn_id),
+        )
+        conn.commit()
+
+
+def log_node_stage(record: dict[str, Any]) -> None:
+    """Save a NodeStageRecord to the node_stages table."""
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            """
+            INSERT INTO node_stages(stage_id, turn_id, session_id, conversation_id, node_name,
+                                   node_class, config_label, start_wall_ms, end_wall_ms,
+                                   timing_json, summary_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(stage_id) DO UPDATE SET
+                end_wall_ms=excluded.end_wall_ms,
+                timing_json=excluded.timing_json,
+                summary_json=excluded.summary_json
+            """,
+            (
+                record.get("stage_id"),
+                record.get("turn_id"),
+                record.get("session_id"),
+                record.get("conversation_id"),
+                record.get("node_name"),
+                record.get("node_class"),
+                record.get("config_label"),
+                record.get("start_wall_ms"),
+                record.get("end_wall_ms"),
+                json.dumps(record.get("timing", {})),
+                json.dumps(record.get("summary", {})),
+            ),
+        )
+        conn.commit()
+
+
+def get_node_stages(turn_id: str) -> list[dict[str, Any]]:
+    """Return all stage records for a turn."""
+    return _rows(
+        "SELECT * FROM node_stages WHERE turn_id=? ORDER BY start_wall_ms",
+        (turn_id,),
+    )
+
+
+def get_inter_stage_events(turn_id: str) -> list[dict[str, Any]]:
+    """Return all inter-stage events for a turn."""
+    return _rows(
+        "SELECT * FROM inter_stage_events WHERE turn_id=? ORDER BY seq",
+        (turn_id,),
+    )
+
+
+def get_keep_warm_pings(parent_turn_id: str = None) -> list[dict[str, Any]]:
+    """Return keep-alive pings, optionally filtered by parent turn."""
+    if parent_turn_id:
+        return _rows(
+            "SELECT * FROM keep_warm_pings WHERE parent_turn_id=? ORDER BY wallclock_ms",
+            (parent_turn_id,),
+        )
+    return _rows(
+        "SELECT * FROM keep_warm_pings ORDER BY wallclock_ms",
+    )
