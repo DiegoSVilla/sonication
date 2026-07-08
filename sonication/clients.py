@@ -110,45 +110,17 @@ async def transcribe(
     filename: str = "audio.wav",
     content_type: str = "audio/wav",
     language: str | None = None,
-    input_format: str | None = None,
 ) -> dict[str, Any]:
     """STT: transcribe audio via /v1/audio/transcriptions (multipart).
 
-    Args:
-        audio: Raw audio bytes.
-        filename: Filename sent with the multipart upload.
-        content_type: MIME type of the audio file.
-        language: Optional language code.
-        input_format: Explicit input format hint (e.g. "pcm", "wav", "flac") sent
-                      as the ``input_format`` query/body parameter.  When set to
-                      ``"pcm"`` the raw PCM bytes are automatically wrapped in a
-                      minimal WAV container so the STT endpoint can parse them.
-                      Defaults to ``None`` — the endpoint decides based on the file
-                      extension and content_type.
-
-    The STT endpoint behaviour is general — it does not assume TTS output.
-    Use ``input_format="pcm"`` only when you know the bytes are raw PCM.
+    Expects audio already in a format the STT endpoint accepts (typically WAV).
+    The STTNode wraps raw PCM in WAV with the configured sample_rate before
+    calling this function.
     """
-    if input_format == "pcm":
-        import io
-        import wave
-
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio)
-        audio = buf.getvalue()
-        content_type = "audio/wav"
-        filename = "audio.wav"
-
     files = {"file": (filename, audio, content_type)}
     data: dict[str, str] = {"model": config.STT_MODEL}
     if language:
         data["language"] = language
-    if input_format:
-        data["input_format"] = input_format
     url = f"{config.STT_BASE_URL}/v1/audio/transcriptions"
     resp = await get_client().post(url, files=files, data=data,
                                     headers=config.bearer(config.STT_API_KEY))

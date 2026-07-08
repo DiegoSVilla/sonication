@@ -115,20 +115,21 @@ class STTNode(Node):
 
     _config_label = NodeConfigLabel.STT_NON_STREAMING
 
-    def __init__(self, base_url: str, api_key: str = "", db=None):
+    def __init__(self, base_url: str, api_key: str = "", db=None, sample_rate: int = 16000):
         super().__init__(base_url, api_key, db)
+        self.sample_rate = sample_rate
 
     def route(self) -> str:
         return "/v1/audio/transcriptions"
 
     async def stream(self, audio_bytes: bytes, language: str = None) -> AsyncIterator[dict]:
-        """Transcribe PCM audio. Converts to WAV internally."""
+        """Transcribe PCM audio. Wraps raw PCM in WAV with configured sample_rate."""
         try:
             wav_buf = io.BytesIO()
             with wave.open(wav_buf, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(config.AUDIO_SAMPLE_RATE)
+                wf.setframerate(self.sample_rate)
                 wf.writeframes(audio_bytes)
             wav_bytes = wav_buf.getvalue()
 
