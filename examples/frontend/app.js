@@ -105,7 +105,9 @@ function stopRecordingAndSend() {
   }
   setMic("processing");
   const wav = encodeWav(flat, audioCtx.sampleRate);
-  send({ type: "user_audio", audio_b64: abToB64(wav) });
+  const b64 = abToB64(wav);
+  console.log(`[pizza] sending WAV: ${wav.byteLength} bytes, ${audioCtx.sampleRate}Hz, ${flat.length} samples`);
+  send({ type: "user_audio", audio_b64: b64 });
 }
 
 function encodeWav(samples, sampleRate) {

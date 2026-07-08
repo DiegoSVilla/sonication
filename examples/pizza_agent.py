@@ -9,6 +9,9 @@ Usage:
 
 The server will start on http://localhost:8000
 Open in a browser and hold Enter to talk.
+
+Curl API:
+    curl -X POST http://localhost:8000/turn -F "file=@audio.wav"
 """
 import asyncio
 import base64
@@ -19,8 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 import sonication
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
@@ -196,6 +199,73 @@ async def get_stats():
     if pizza_agent:
         return pizza_agent.get_stats()
     return {"error": "Pipeline not initialized"}
+
+
+@app.post("/turn")
+async def curl_turn(file: UploadFile):
+    """Process audio from curl. Accepts WAV file, returns JSON with transcript and response.
+    
+    Usage:
+        curl -X POST http://localhost:8000/turn -F "file=@audio.wav"
+    """
+    if not pizza_agent:
+        return JSONResponse({"error": "Pipeline not initialized"}, status_code=503)
+    
+    try:
+        audio_bytes = await file.read()
+        logger.info(f"Curl turn: {len(audio_bytes)} bytes received")
+        result = await pizza_agent.run_turn(audio_bytes, "curl")
+        return JSONResponse(result)
+    except Exception as e:
+        logger.error(f"Turn error: {e}", exc_info=True)
+        return JSONResponse({"type": "error", "message": str(e)}, status_code=500)
+
+
+@app.websocket("/curl_turn")
+async def curl_ws_turn(ws: WebSocket):
+    """Process audio from curl via WebSocket — same path as browser.
+    
+    Usage:
+        # Encode WAV to base64 and send via WebSocket
+        python3 -c "
+        import base64, websockets
+        audio = open('/tmp/test.wav','rb').read()
+        b64 = base64.b64encode(audio).decode()
+        ws = await websockets.connect('ws://localhost:8000/curl_turn')
+        await ws.send('{\"type\":\"user_audio\",\"audio_b64\":\"' + b64 + '\"}')
+        resp = await ws.recv()
+        print(resp)
+        await ws.close()
+        "
+    """
+    await ws.accept()
+    session_id = f"curl_{__import__('uuid').uuid4().hex[:8]}"
+    await ws.send_json({
+        "type": "system",
+        "message": f"Curl WS connected. Session: {session_id}",
+    })
+    
+    try:
+        data = await ws.receive_json()
+        msg_type = data.get("type", "")
+        
+        if msg_type == "user_audio":
+            audio_b64 = data.get("audio_b64", "")
+            audio_bytes = base64.b64decode(audio_b64)
+            logger.info(f"Curl WS: {len(audio_bytes)} bytes base64-decoded")
+            try:
+                result = await pizza_agent.run_turn(audio_bytes, session_id)
+                await ws.send_json(result)
+            except Exception as e:
+                logger.error(f"Turn error: {e}", exc_info=True)
+                await ws.send_json({"type": "error", "message": str(e)})
+        else:
+            await ws.send_json({"type": "error", "message": f"Unknown type: {msg_type}"})
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await ws.send_json({"type": "error", "message": str(e)})
+    finally:
+        await ws.close()
 
 
 def main():

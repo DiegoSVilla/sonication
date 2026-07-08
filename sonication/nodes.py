@@ -150,7 +150,10 @@ class STTNode(Node):
 
             if fmt == "wav":
                 # Already WAV — pass through directly (like minimalVoice)
-                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes WAV")
+                is_wav = audio_bytes[:4] == b'RIFF'
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes, is_wav={is_wav}, sample_rate_hint={int.from_bytes(audio_bytes[24:28], 'little') if len(audio_bytes) >= 28 else '?'}")
+                if not is_wav:
+                    logger.warning(f"STTNode.stream: WAV format but no RIFF header! First 8 bytes: {audio_bytes[:8].hex()}")
                 result = await clients.transcribe(audio_bytes, filename="audio.wav",
                                                    content_type="audio/wav", language=lang)
 
