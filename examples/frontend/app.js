@@ -4,6 +4,7 @@
 
 let ws = null;
 let audioCtx = null;
+let sessionId = null;  // unique session ID for debugging
 
 // Recording state.
 let recording = false;
@@ -17,6 +18,8 @@ const transcript = $("transcript");
 const shotTimes = [];
 
 function connect() {
+  sessionId = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+  $("session-id").textContent = sessionId;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen = () => $("dot").classList.add("on");
@@ -55,6 +58,15 @@ function bubble(role, text) {
   transcript.appendChild(el);
   transcript.scrollTop = transcript.scrollHeight;
   return el;
+}
+
+function bubbleSystem(text) {
+  const el = document.createElement("div");
+  el.className = "msg system";
+  el.style.cssText = "background:#21262d;border:1px solid #30363d;font-size:11px;color:#7d8590;font-family:ui-monospace;";
+  el.textContent = text;
+  transcript.appendChild(el);
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
 // ---- recording ----
@@ -162,6 +174,9 @@ function renderWaterfall(segments) {
 
 function handle(msg) {
   switch (msg.type) {
+    case "system":
+      bubbleSystem(msg.message);
+      break;
     case "response":
       bubble("user", msg.stt_text || "(no speech detected)");
       bubble("assistant", msg.llm_response || "");

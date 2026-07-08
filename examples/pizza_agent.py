@@ -85,10 +85,10 @@ class PizzaAgent:
         await self.pipeline.warmup()
         logger.info("All nodes warm.")
 
-    async def run_turn(self, audio_bytes: bytes) -> dict:
+    async def run_turn(self, audio_bytes: bytes, session_id: str = "") -> dict:
         """Process one turn (audio input) and return results."""
         self.turn_count += 1
-        logger.info(f"Processing turn {self.turn_count}...")
+        logger.info(f"Processing turn {self.turn_count} [session={session_id}]...")
 
         result = await self.pipeline.turn("stt", audio_bytes)
 
@@ -148,12 +148,15 @@ async def index():
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """WebSocket endpoint for live pizza ordering conversation."""
+    import uuid
     await ws.accept()
-    logger.info("Client connected.")
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    logger.info(f"Client connected. Session: {session_id}")
 
     await ws.send_json({
         "type": "system",
-        "message": "Welcome to Marco's Pizza! Hold Enter to speak.",
+        "message": f"Welcome to Marco's Pizza! Session: {session_id}",
+        "session_id": session_id,
     })
 
     try:
@@ -165,10 +168,10 @@ async def websocket_endpoint(ws: WebSocket):
                 audio_b64 = data.get("audio_b64", "")
                 audio_bytes = base64.b64decode(audio_b64)
                 try:
-                    result = await pizza_agent.run_turn(audio_bytes)
+                    result = await pizza_agent.run_turn(audio_bytes, session_id)
                     await ws.send_json(result)
                 except Exception as e:
-                    logger.error(f"Turn error: {e}")
+                    logger.error(f"Turn error: {e}", exc_info=True)
                     await ws.send_json({"type": "error", "message": str(e)})
 
             elif msg_type == "stats":
