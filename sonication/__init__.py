@@ -41,6 +41,7 @@ from .node_types import NodeConfigLabel, PipelineType, get_inter_stage_event
 from .analysis import (
     LatencyAnalyser, PipelineAnalysis, AnalysisSegment, _PIPELINE_SEGMENTS,
 )
+from .log_manager import LogManager
 from .db import (
     init_db, log_pipe_event, log_node_event,
     insert_inter_stage_event, log_keep_warm_ping, log_node_stage,
@@ -61,6 +62,7 @@ __all__ = [
     'NodeEvent', 'InterStageEvent', 'PhaseBoundary', 'NodeStageRecord',
     'LatencyAnalyser', 'PipelineAnalysis', 'AnalysisSegment', '_PIPELINE_SEGMENTS',
     'CALL_START', 'CALL_END',
+    'LogManager',
     'init_db', 'log_pipe_event', 'log_node_event',
     'insert_inter_stage_event', 'log_keep_warm_ping', 'log_node_stage',
     'get_node_stages', 'get_inter_stage_events', 'get_keep_warm_pings',

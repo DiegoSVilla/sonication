@@ -69,7 +69,7 @@ DB_PATH = DATA_DIR / "calls.db"
 
 def bearer(key: str) -> dict[str, str]:
     """Authorization header for a key, or empty dict when the key is unset."""
-    return {"Authorization": f"Bearer {key}" if key else {}}
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 def pcm_bytes_to_ms(num_bytes: int) -> float:

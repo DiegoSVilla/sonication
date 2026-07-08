@@ -66,7 +66,7 @@ class PizzaAgent:
             llm_url,
             system_prompt=PIZZA_SYSTEM_PROMPT,
         )
-        self.tts_node = sonication.TTSNode(tts_url, voice="Marco", language="English")
+        self.tts_node = sonication.TTSNode(tts_url, voice="ryan", language="English")
 
         # Create pipeline — context management is internal to LLMNode
         self.pipeline = sonication.HotPipe(
@@ -105,6 +105,7 @@ class PizzaAgent:
             segments = []
 
         return {
+            "type": "response",
             "turn_index": self.turn_count,
             "stt_text": result.get("stt_text", ""),
             "llm_response": result.get("llm_response", ""),
@@ -163,8 +164,12 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "user_audio":
                 audio_b64 = data.get("audio_b64", "")
                 audio_bytes = base64.b64decode(audio_b64)
-                result = await pizza_agent.run_turn(audio_bytes)
-                await ws.send_json(result)
+                try:
+                    result = await pizza_agent.run_turn(audio_bytes)
+                    await ws.send_json(result)
+                except Exception as e:
+                    logger.error(f"Turn error: {e}")
+                    await ws.send_json({"type": "error", "message": str(e)})
 
             elif msg_type == "stats":
                 await ws.send_json({
@@ -177,6 +182,8 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await ws.send_json({"type": "error", "message": str(e)})
+    finally:
+        await ws.close()
 
 
 @app.get("/stats")
@@ -191,7 +198,7 @@ def main():
     """Run the pizza agent server."""
     import uvicorn
     logger.info("Starting Pizza Agent server on http://localhost:8000")
-    uvicorn.run("examples.pizza_agent:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("examples.pizza_agent:app", host="0.0.0.0", port=8000, reload=False)
 
 
 if __name__ == "__main__":

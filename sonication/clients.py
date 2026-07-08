@@ -80,13 +80,17 @@ async def stream_llm(
 async def stream_tts(
     text: str, voice: str, language: str
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield audio chunks from /v1/audio/speech (response_format=pcm, streamed)."""
+    """Yield audio chunks from /v1/audio/speech (response_format=pcm, streamed).
+
+    Uses stream_format='audio' to get raw PCM bytes instead of SSE events.
+    """
     body = {
         "input": text,
         "voice": voice,
         "language": language,
         "stream": True,
         "response_format": "pcm",
+        "stream_format": "audio",
     }
     if config.TTS_MODEL:
         body["model"] = config.TTS_MODEL
@@ -94,25 +98,11 @@ async def stream_tts(
     async with get_client().stream("POST", url, json=body,
                                     headers=config.bearer(config.TTS_API_KEY)) as resp:
         resp.raise_for_status()
-        async for line in resp.aiter_lines():
-            if not line or not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if not data:
-                continue
-            try:
-                obj = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            otype = obj.get("type")
-            if otype == "speech.audio.delta":
-                b64 = obj.get("audio")
-                if b64:
-                    yield {"kind": "audio", "pcm": base64.b64decode(b64)}
-            elif otype == "speech.audio.done":
-                if obj.get("usage"):
-                    yield {"kind": "usage", "usage": obj["usage"]}
-                yield {"kind": "done"}
+        # Read raw PCM bytes directly
+        async for chunk in resp.aiter_bytes(chunk_size=8192):
+            if chunk:
+                yield {"kind": "audio", "pcm": chunk}
+        yield {"kind": "done"}
 
 
 async def transcribe(
@@ -120,12 +110,45 @@ async def transcribe(
     filename: str = "audio.wav",
     content_type: str = "audio/wav",
     language: str | None = None,
+    input_format: str | None = None,
 ) -> dict[str, Any]:
-    """STT: transcribe audio via /v1/audio/transcriptions (multipart)."""
+    """STT: transcribe audio via /v1/audio/transcriptions (multipart).
+
+    Args:
+        audio: Raw audio bytes.
+        filename: Filename sent with the multipart upload.
+        content_type: MIME type of the audio file.
+        language: Optional language code.
+        input_format: Explicit input format hint (e.g. "pcm", "wav", "flac") sent
+                      as the ``input_format`` query/body parameter.  When set to
+                      ``"pcm"`` the raw PCM bytes are automatically wrapped in a
+                      minimal WAV container so the STT endpoint can parse them.
+                      Defaults to ``None`` — the endpoint decides based on the file
+                      extension and content_type.
+
+    The STT endpoint behaviour is general — it does not assume TTS output.
+    Use ``input_format="pcm"`` only when you know the bytes are raw PCM.
+    """
+    if input_format == "pcm":
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(audio)
+        audio = buf.getvalue()
+        content_type = "audio/wav"
+        filename = "audio.wav"
+
     files = {"file": (filename, audio, content_type)}
-    data: dict[str, str] = {"model": config.STT_MODEL, "response_format": "json"}
+    data: dict[str, str] = {"model": config.STT_MODEL}
     if language:
         data["language"] = language
+    if input_format:
+        data["input_format"] = input_format
     url = f"{config.STT_BASE_URL}/v1/audio/transcriptions"
     resp = await get_client().post(url, files=files, data=data,
                                     headers=config.bearer(config.STT_API_KEY))

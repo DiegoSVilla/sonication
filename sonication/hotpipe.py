@@ -174,6 +174,9 @@ class Turn:
 
     async def run(self, pipe, data):
         """Execute the pipeline from the entry node (auto-detected from topology)."""
+        # Store log_manager reference for _enqueue_event
+        self._log_manager = pipe._log_manager
+        
         # Auto-detect entry point from topology
         entry_point = self._detect_entry_point(pipe)
         
@@ -187,6 +190,12 @@ class Turn:
             local_offset_ms=self._now(),
             payload={"pipeline_type": self._pipeline_type, "entry_node": entry_point}
         ))
+        if self._log_manager:
+            self._log_manager.enqueue({
+                "_log_kind": "inter_stage",
+                **self.inter_stage_events[-1].__dict__,
+            })
+        
         try:
             await self._walk(pipe, entry_point, data)
         except Exception as e:
@@ -241,6 +250,9 @@ class Turn:
 
         # Track streaming state for LLM->TTS phrase gate
         llm_text_buffer = ""
+        
+        # Track TTS audio chunks
+        tts_audio_chunks = []
 
         # Record node start event
         seq = self._next_seq()
@@ -252,7 +264,7 @@ class Turn:
             seq=seq
         )
         self.events.append(start_event)
-        log_pipe_event(start_event.to_dict())
+        self._enqueue_event(start_event.to_dict())
         last_event_event_id = start_event.event_id
 
         # Record phase boundary for start (t_start = t_first_event)
@@ -276,6 +288,17 @@ class Turn:
                 if "content" in raw and node_name == "llm":
                     llm_text_buffer += raw.get("content", "")
 
+                # Capture TTS audio chunks
+                if node_name == "tts" and raw.get("kind") == "audio":
+                    pcm_data = raw.get("pcm", b"")
+                    if pcm_data:
+                        tts_audio_chunks.append(pcm_data)
+
+                # Capture STT transcript while iterating (last_event_type
+                # will be "done" after the loop, not "transcript")
+                if node_name == "stt" and raw.get("kind") == "transcript":
+                    self.stt_text = raw.get("text", "")
+
                 # Check phrase gate readiness
                 if node_name == "llm" and llm_text_buffer and config_label in (NodeConfigLabel.LLM_STREAMING, NodeConfigLabel.LLM_STREAMING_WITH_REASONING):
                     downstream_tts = any(
@@ -297,6 +320,10 @@ class Turn:
                 if hasattr(node, 'complete_turn') and stt_input:
                     node.complete_turn(stt_input, llm_text_buffer)
 
+            # Store TTS audio
+            if node_name == "tts" and tts_audio_chunks:
+                self.tts_audio = b"".join(tts_audio_chunks)
+
             # Update node data for legacy compatibility
             last_stored_event = last_event_data
 
@@ -310,9 +337,7 @@ class Turn:
             self.record_node_stage(stage_record)
 
         # Legacy data extraction (preserved for compat)
-        if node_name == "stt" and last_event_type == "transcript":
-            self.stt_text = last_stored_event.get("text", "") if isinstance(last_stored_event, dict) else ""
-        elif node_name == "tts":
+        if node_name == "tts":
             pass  # TTS audio stored in _node_data by HotPipe
 
         # Follow downstream connections
@@ -452,7 +477,7 @@ class Turn:
         return None
 
     async def _log_event(self, raw, node_name, parent_id=None, stage_id="", seq=0):
-        """Log a node event to events list and database."""
+        """Log a node event to events list and queue (or skip if no log_manager)."""
         kind = raw.get("kind", "unknown")
         if node_name == "stt":
             etype = {"transcript": "stt_transcript", "error": f"stt_{kind}",
@@ -473,10 +498,17 @@ class Turn:
                            parent_event_id=parent_id,
                            stage_id=stage_id, seq=seq)
         self.events.append(pe)
-        try:
-            log_pipe_event(pe.to_dict())
-        except Exception as e:
-            logger.warning(f"Failed to log event: {e}")
+        self._enqueue_event(pe.to_dict())
+
+    def _enqueue_event(self, event_dict: dict) -> None:
+        """Enqueue an event to the log_manager, or skip if disabled."""
+        # Get log_manager from pipe (set by HotPipe.connect())
+        # We store it on the Turn via run() if available
+        if hasattr(self, '_log_manager') and self._log_manager:
+            try:
+                self._log_manager.enqueue(event_dict)
+            except RuntimeError:
+                pass  # queue full — don't block the pipeline
 
     def _next_seq(self) -> int:
         """Return an incrementing sequence number."""
@@ -500,11 +532,12 @@ class Turn:
                 "buffered_text": buffered_text[:200],
             }
         ))
-        try:
-            from .db import insert_inter_stage_event
-            insert_inter_stage_event(self.inter_stage_events[-1].__dict__)
-        except Exception:
-            pass
+        # Enqueue via log_manager if available
+        if self._log_manager:
+            self._log_manager.enqueue({
+                "_log_kind": "inter_stage",
+                **self.inter_stage_events[-1].__dict__,
+            })
 
 
 def stream_sync(async_iter_factory, *args, **kwargs):
@@ -527,6 +560,10 @@ class HotPipe:
         - connect() validates topology — wiring is 100% topology-driven
     
     Node whitelist: STTNode, LLMNode, TTSNode only.
+    
+    Logging:
+        Pass a LogManager instance to enable event logging.
+        If log_manager is None, all logging is disabled.
     """
     
     # Topology definitions per PipelineType
@@ -590,13 +627,20 @@ class HotPipe:
         },
     }
 
-    def __init__(self, pipeline_type: PipelineType):
-        """Pipeline type is REQUIRED at init."""
+    def __init__(self, pipeline_type: PipelineType, log_manager=None):
+        """Pipeline type is REQUIRED at init.
+        
+        Args:
+            pipeline_type: The pipeline topology to use.
+            log_manager: Optional LogManager instance for event logging.
+                        If None, all logging is disabled.
+        """
         if not pipeline_type:
             raise ValueError(
                 "HotPipe requires pipeline_type at init. Got None.")
 
         self.pipeline_type = pipeline_type
+        self._log_manager = log_manager
         
         # _slots maps slot_name -> Node instance
         self._slots: Dict[str, Any] = {}
@@ -615,7 +659,7 @@ class HotPipe:
         if not self._pipeline_topology:
             raise ValueError(f"Unknown pipeline type: {pipeline_type}")
         
-        self._connections: List[Tuple[str, str]] = []
+        self._unconnected_nodes: List[Any] = []  # actual node objects, resolved on connect()
         self._node_data = {}  # name -> list of raw events
         self._nodes_health = {}  # name -> [rtt_ms ...]
         self._ping_loop = None
@@ -634,6 +678,8 @@ class HotPipe:
         
         Only accept STTNode, LLMNode, TTSNode as node types.
         Custom classes/subclasses NOT ALLOWED.
+        
+        Connections are NOT established here. They are resolved in connect().
         """
         from .nodes import Node
         
@@ -689,37 +735,69 @@ class HotPipe:
             slot_name = slot["slot_name"]
             self.nodes[slot_name] = (node, slot["config_label"])
             self.connections[slot_name] = []
+            self._unconnected_nodes.append(node)
             config_label = slot["config_label"]
             
             # Assign config_label to node
             if hasattr(node, '_config_label'):
                 node._config_label = config_label
-        
-        # Track connections from topology
-        for conn in self._pipeline_topology["connections"]:
-            if conn not in self._connections:
-                self._connections.append(conn)
-                if conn[0] in self.connections:
-                    if conn[1] not in self.connections[conn[0]]:
-                        self.connections[conn[0]].append(conn[1])
+            
+            logger.debug(f"Added {node_class} to slot {slot_name} (unconnected)")
 
     def connect(self) -> bool:
-        """Validate all nodes are connected and topology is sound.
+        """Validate all nodes are connected and resolve topology connections.
         
-        This is a validation trigger — wiring is already in place from
-        topology. Just checks that all expected slots have nodes.
+        This is where wiring happens — connections are resolved from the
+        pipeline topology. Before connect(), nodes are registered but not
+        wired together. After connect(), connections are fully established.
+        
+        Validates:
+        - Exactly the right number of nodes were added
+        - No extra nodes beyond what the topology needs
+        - All topology connections can be resolved
+        
+        Also passes the log_manager to each node if one is set on the pipe.
         """
-        self._validate_topology()
-        return True
-
-    def _validate_topology(self) -> None:
-        """Check all expected slots are filled."""
-        for slot in self._pipeline_topology["slots"]:
-            if slot["slot_name"] not in self._slots:
+        expected_slots = len(self._pipeline_topology["slots"])
+        actual_nodes = len(self._slots)
+        
+        if actual_nodes > expected_slots:
+            extra = [n for n in self._unconnected_nodes if n not in self._slots.values()]
+            raise ValueError(
+                f"Too many nodes: added {actual_nodes}, expected {expected_slots}. "
+                f"Extra nodes: {[n.__class__.__name__ for n in extra]}"
+            )
+        
+        if actual_nodes < expected_slots:
+            missing = [s["slot_name"] for s in self._pipeline_topology["slots"]
+                       if s["slot_name"] not in self._slots]
+            raise ValueError(
+                f"Not enough nodes: added {actual_nodes}, expected {expected_slots}. "
+                f"Missing slots: {missing}"
+            )
+        
+        # Resolve all connections from topology
+        for src_name, dst_name in self._pipeline_topology["connections"]:
+            if src_name in self.connections and dst_name in self.connections:
+                if dst_name not in self.connections[src_name]:
+                    self.connections[src_name].append(dst_name)
+                    logger.debug(f"Connected {src_name} -> {dst_name}")
+            else:
                 raise ValueError(
-                    f"Missing node for slot '{slot['slot_name']}' "
-                    f"in pipeline '{self.pipeline_type.value}'."
+                    f"Cannot connect {src_name} -> {dst_name}: "
+                    f"one or both slots missing from topology"
                 )
+        
+        # Clear unconnected nodes list — all resolved
+        self._unconnected_nodes.clear()
+        
+        # Pass log_manager to all nodes
+        if self._log_manager is not None:
+            for node, _ in self.nodes.values():
+                if hasattr(node, 'log_manager'):
+                    node.log_manager = self._log_manager
+        
+        return True
 
     def _generate_stage_id(self, node: object, node_name: str) -> str:
         """Generate a deterministic stage_id for a node invocation."""

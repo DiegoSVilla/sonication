@@ -44,6 +44,7 @@ class Node:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.db = db
+        self.log_manager = None  # set by HotPipe.connect()
         self.connection: httpx.AsyncClient = None
         self.is_warm: bool = False
         self._stage_id: Optional[str] = None

@@ -10,12 +10,24 @@ the analysis space can query them without replaying every event.
 import json
 import sqlite3
 import threading
+import time
 from typing import Any, Optional
 
 from . import config
 
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
+
+def _retry(fn, retries=3, delay=0.1):
+    """Retry a DB operation on 'database is locked' errors."""
+    for i in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and i < retries - 1:
+                time.sleep(delay * (2 ** i))
+            else:
+                raise
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -264,19 +276,21 @@ def save_session_state(
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO session_state"
-            "(session_id, history_json, message_count, last_call_id, updated_iso, updated_epoch_ms) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "history_json=excluded.history_json, message_count=excluded.message_count, "
-            "last_call_id=excluded.last_call_id, updated_iso=excluded.updated_iso, "
-            "updated_epoch_ms=excluded.updated_epoch_ms",
-            (session_id, json.dumps(history), len(history), last_call_id,
-             now.isoformat(), now.timestamp() * 1000.0),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO session_state"
+                "(session_id, history_json, message_count, last_call_id, updated_iso, updated_epoch_ms) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "history_json=excluded.history_json, message_count=excluded.message_count, "
+                "last_call_id=excluded.last_call_id, updated_iso=excluded.updated_iso, "
+                "updated_epoch_ms=excluded.updated_epoch_ms",
+                (session_id, json.dumps(history), len(history), last_call_id,
+                 now.isoformat(), now.timestamp() * 1000.0),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 def load_session_state(session_id: str) -> Optional[list[dict[str, Any]]]:
@@ -289,44 +303,48 @@ def load_session_state(session_id: str) -> Optional[list[dict[str, Any]]]:
 
 def insert_event(event: dict[str, Any]) -> None:
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO events(seq, call_id, turn_id, type, t_ms, payload_json) "
-            "VALUES (?,?,?,?,?,?)",
-            (
-                event["seq"],
-                event["call_id"],
-                event["turn_id"],
-                event["type"],
-                event["t_ms"],
-                json.dumps(event["payload"]),
-            ),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO events(seq, call_id, turn_id, type, t_ms, payload_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    event["seq"],
+                    event["call_id"],
+                    event["turn_id"],
+                    event["type"],
+                    event["t_ms"],
+                    json.dumps(event["payload"]),
+                ),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 def log_pipe_event(event: dict[str, Any]) -> None:
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO pipe_events "
-            "(event_id, type, node_name, turn_id, timestamp_wallclock_ms, "
-            "timestamp_local_offset, payload_json, parent_event_id, stage_id, seq) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                event["event_id"],
-                event["type"],
-                event["node_name"],
-                event["turn_id"],
-                event["timestamp_wallclock_ms"],
-                event["timestamp_local_offset"],
-                json.dumps(event["payload"]),
-                event.get("parent_event_id"),
-                event.get("stage_id"),
-                event.get("seq"),
-            ),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO pipe_events "
+                "(event_id, type, node_name, turn_id, timestamp_wallclock_ms, "
+                "timestamp_local_offset, payload_json, parent_event_id, stage_id, seq) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event["event_id"],
+                    event["type"],
+                    event["node_name"],
+                    event["turn_id"],
+                    event["timestamp_wallclock_ms"],
+                    event["timestamp_local_offset"],
+                    json.dumps(event["payload"]),
+                    event.get("parent_event_id"),
+                    event.get("stage_id"),
+                    event.get("seq"),
+                ),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 # ---- read helpers for the analysis space and JSON export ----

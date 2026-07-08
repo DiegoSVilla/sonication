@@ -148,7 +148,7 @@ class PhaseBoundary:
     event_id: str
 
 
-@_dataclass(frozen=True)
+@_dataclass
 class NodeStageRecord:
     """Per-invocation record for a node stage in a turn."""
     stage_id: str
