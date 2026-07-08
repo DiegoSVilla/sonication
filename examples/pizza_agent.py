@@ -12,7 +12,6 @@ Connect via WebSocket at ws://localhost:8000/ws
 """
 import asyncio
 import base64
-import json
 import logging
 from typing import Optional
 
@@ -90,28 +89,6 @@ class PizzaAgent:
             "shot_latency_ms": result.get("shot_latency_ms", 0),
         }
 
-    async def run_text_turn(self, text: str) -> dict:
-        """Process one text-only turn (skips STT)."""
-        self.turn_count += 1
-        logger.info(f"Processing text turn {self.turn_count}: {text[:50]}...")
-
-        # For text input, use the two-step pipeline (LLM → TTS)
-        text_pipeline = sonication.HotPipe(
-            pipeline_type=sonication.PipelineType.TI_SO_TWO_STEP_PIPELINE_CHAT
-        )
-        text_pipeline.add_node(self.llm_node)
-        text_pipeline.add_node(self.tts_node)
-        text_pipeline.connect()
-
-        result = await text_pipeline.turn("llm", text)
-
-        return {
-            "turn_index": self.turn_count,
-            "stt_text": text,
-            "llm_response": result.get("llm_response", ""),
-            "shot_latency_ms": result.get("shot_latency_ms", 0),
-        }
-
     def get_stats(self) -> dict:
         """Return pipeline statistics."""
         return {
@@ -155,17 +132,7 @@ async def websocket_endpoint(ws: WebSocket):
             msg_type = data.get("type", "")
             content = data.get("content", "")
 
-            if msg_type == "text":
-                result = await pizza_agent.run_text_turn(content)
-                await ws.send_json({
-                    "type": "response",
-                    "turn_index": result["turn_index"],
-                    "stt_text": result["stt_text"],
-                    "llm_response": result["llm_response"],
-                    "shot_latency_ms": result["shot_latency_ms"],
-                })
-
-            elif msg_type == "audio":
+            if msg_type == "audio":
                 audio_bytes = base64.b64decode(content)
                 result = await pizza_agent.run_turn(audio_bytes)
                 await ws.send_json({
