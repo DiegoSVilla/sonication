@@ -15,8 +15,17 @@ from typing import Dict, Any, Optional
 
 @dataclass(frozen=True)
 class PipeEvent:
-    type: str
-    node_name: str
+    """Unified event from any node or pseudo-node in the pipeline.
+    
+    Every event has a consistent structure regardless of source:
+        event_type: "start", "chunk", "token", "response", "done", "usage", "error"
+        emitter_node: "stt", "llm", "tts", "phrase_gate"
+        emitter_type: "STT_NON_STREAMING", "LLM_STREAMING", etc.
+        turn_id, stage_id, wallclock_ms, local_offset_ms, payload, seq
+    """
+    event_type: str
+    emitter_node: str
+    emitter_type: str
     turn_id: str
     wallclock_ms: float
     local_offset_ms: float
@@ -26,12 +35,22 @@ class PipeEvent:
     stage_id: str = ""
     seq: int = 0
 
+    # Backward-compatible aliases
+    @property
+    def type(self) -> str:
+        return self.event_type
+
+    @property
+    def node_name(self) -> str:
+        return self.emitter_node
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict suitable for db.log_pipe_event()."""
         return {
             "event_id": self.event_id,
-            "type": self.type,
-            "node_name": self.node_name,
+            "event_type": self.event_type,
+            "node_name": self.emitter_node,
+            "emitter_type": self.emitter_type,
             "turn_id": self.turn_id,
             "timestamp_wallclock_ms": self.wallclock_ms,
             "timestamp_local_offset": self.local_offset_ms,
@@ -42,7 +61,8 @@ class PipeEvent:
         }
 
     @classmethod
-    def new(cls, event_type: str, node_name: str, turn_id: str,
+    def new(cls, event_type: str, emitter_node: str, emitter_type: str,
+            turn_id: str,
             local_offset_ms: float = 0.0,
             payload: Optional[Dict[str, Any]] = None,
             parent_event_id: Optional[str] = None,
@@ -50,8 +70,9 @@ class PipeEvent:
             seq: int = 0) -> "PipeEvent":
         """Create a PipeEvent with auto-timestamps."""
         return cls(
-            type=event_type,
-            node_name=node_name,
+            event_type=event_type,
+            emitter_node=emitter_node,
+            emitter_type=emitter_type,
             turn_id=turn_id,
             wallclock_ms=time.time() * 1000,
             local_offset_ms=local_offset_ms,
@@ -60,6 +81,7 @@ class PipeEvent:
             stage_id=stage_id,
             seq=seq,
         )
+
 
 # Event type constants. The vad_/stt_ types are reserved for the future
 # VAD -> turn-selector -> STT front of the pipeline and are not emitted yet.
@@ -164,7 +186,11 @@ class NodeStageRecord:
 
 @_dataclass(frozen=True)
 class InterStageEvent:
-    """HotPipe-synthesized event between two stages."""
+    """HotPipe-synthesized event between two stages.
+    
+    DEPRECATED: Use unified PipeEvent with emitter_node="phrase_gate" instead.
+    Kept for backward compatibility during migration.
+    """
     event_type: str
     wallclock_ms: float
     local_offset_ms: float = 0.0

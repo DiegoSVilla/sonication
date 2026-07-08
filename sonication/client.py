@@ -16,6 +16,7 @@ Usage:
     async for chunk in stream_llm(messages):  # client=None → creates temp client
         ...
 """
+import base64
 import json
 from typing import Any, AsyncIterator, Optional
 
@@ -112,7 +113,9 @@ async def stream_tts(
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield audio chunks from /v1/audio/speech (response_format=pcm, streamed).
 
-    Uses stream_format='audio' to get raw PCM bytes instead of SSE events.
+    The TTS endpoint speaks SSE events: speech.audio.delta (base64-encoded PCM)
+    and speech.audio.done (with usage info). This function parses those events
+    and yields dicts with kind "audio", "usage", and "done".
 
     Args:
         text: Text to synthesize.
@@ -127,7 +130,6 @@ async def stream_tts(
         "language": language,
         "stream": True,
         "response_format": "pcm",
-        "stream_format": "audio",
     }
     if config.TTS_MODEL:
         body["model"] = config.TTS_MODEL
@@ -137,10 +139,25 @@ async def stream_tts(
         async with client.stream("POST", url, json=body,
                                  headers=config.bearer(config.TTS_API_KEY)) as resp:
             resp.raise_for_status()
-            async for chunk in resp.aiter_bytes(chunk_size=8192):
-                if chunk:
-                    yield {"kind": "audio", "pcm": chunk}
-            yield {"kind": "done"}
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if not data:
+                    continue
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                otype = obj.get("type")
+                if otype == "speech.audio.delta":
+                    b64 = obj.get("audio")
+                    if b64:
+                        yield {"kind": "audio", "pcm": base64.b64decode(b64)}
+                elif otype == "speech.audio.done":
+                    if obj.get("usage"):
+                        yield {"kind": "usage", "usage": obj["usage"]}
+                    yield {"kind": "done"}
     finally:
         if close_after:
             await client.aclose()
