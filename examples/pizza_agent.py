@@ -109,6 +109,7 @@ class PizzaAgent:
             "turn_index": self.turn_count,
             "stt_text": result.get("stt_text", ""),
             "llm_response": result.get("llm_response", ""),
+            "tts_audio_b64": base64.b64encode(result.get("tts_audio", b"")).decode("ascii") if result.get("tts_audio") else "",
             "shot_latency_ms": result.get("shot_latency_ms", 0),
             "segments": segments,
         }

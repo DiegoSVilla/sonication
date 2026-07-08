@@ -148,13 +148,42 @@ function abToB64(ab) {
 
 // ---- playback ----
 
-function speak(text) {
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.0;
-    u.pitch = 1.0;
-    window.speechSynthesis.speak(u);
+const TTS_SAMPLE_RATE = 24000;
+let ttsPlayCursor = 0;
+const ttsPlaybackReported = new Set();
+
+function pcmFromB64(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const view = new DataView(bytes.buffer);
+  const n = bytes.length >> 1;
+  const f32 = new Float32Array(n);
+  for (let i = 0; i < n; i++) f32[i] = view.getInt16(i * 2, true) / 32768;
+  return f32;
+}
+
+function playTtsChunk(msg) {
+  ensureAudio();
+  if (!msg.pcm_b64) return;
+  const f32 = pcmFromB64(msg.pcm_b64);
+  const buf = audioCtx.createBuffer(1, f32.length, TTS_SAMPLE_RATE);
+  buf.getChannelData(0).set(f32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const startAt = Math.max(audioCtx.currentTime, ttsPlayCursor);
+  src.start(startAt);
+  ttsPlayCursor = startAt + buf.duration;
+
+  if (!ttsPlaybackReported.has(msg.turn_index)) {
+    ttsPlaybackReported.add(msg.turn_index);
+    setMic("idle");
+    const delayMs = Math.max(0, (startAt - audioCtx.currentTime) * 1000);
+    setTimeout(() => {
+      send({ type: "channel_playback_start", turn_index: msg.turn_index,
+             phrase_index: msg.phrase_index, chunk_index: msg.chunk_index });
+    }, delayMs);
   }
 }
 
@@ -180,7 +209,9 @@ function handle(msg) {
     case "response":
       bubble("user", msg.stt_text || "(no speech detected)");
       bubble("assistant", msg.llm_response || "");
-      speak(msg.llm_response);
+      if (msg.tts_audio_b64) {
+        playTtsChunk({ pcm_b64: msg.tts_audio_b64, turn_index: msg.turn_index });
+      }
       if (msg.shot_latency_ms) {
         $("latency").textContent = msg.shot_latency_ms + "ms";
         shotTimes.push(msg.shot_latency_ms);
@@ -192,6 +223,11 @@ function handle(msg) {
       if (msg.segments) {
         renderWaterfall(msg.segments);
       }
+      break;
+    case "audio_out":
+      playTtsChunk(msg);
+      break;
+    case "channel_playback_start":
       setMic("idle");
       break;
     case "error":

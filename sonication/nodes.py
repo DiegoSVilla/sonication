@@ -125,6 +125,7 @@ class STTNode(Node):
     async def stream(self, audio_bytes: bytes, language: str = None) -> AsyncIterator[dict]:
         """Transcribe PCM audio. Wraps raw PCM in WAV with configured sample_rate."""
         try:
+            logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes PCM")
             wav_buf = io.BytesIO()
             with wave.open(wav_buf, "wb") as wf:
                 wf.setnchannels(1)
@@ -132,9 +133,11 @@ class STTNode(Node):
                 wf.setframerate(self.sample_rate)
                 wf.writeframes(audio_bytes)
             wav_bytes = wav_buf.getvalue()
+            logger.info(f"STTNode.stream: created {len(wav_bytes)} bytes WAV")
 
-            result = await clients.transcribe(wav_bytes, filename="audio.wav", language=language)
+            result = await clients.transcribe(wav_bytes, filename="audio.wav", language=language or config.STT_LANGUAGE)
             text = result.get("text", "")
+            logger.info(f"STT result: text='{text}', raw_keys={list(result.keys())}, raw={result}")
             yield {"kind": "transcript", "text": text, "usage": result.get("usage", {})}
             yield {"kind": "done", "text": text}
 
