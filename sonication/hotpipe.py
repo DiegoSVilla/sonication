@@ -289,6 +289,14 @@ class Turn:
             # After stream completes — record end boundaries
             self._record_end_boundary(stage_record, node_name, node_start_wc)
 
+            # Store accumulated LLM text for downstream stages
+            if node_name == "llm":
+                self.llm_text = llm_text_buffer
+                # Complete the turn in LLMNode's internal history
+                stt_input = self.stt_text
+                if hasattr(node, 'complete_turn') and stt_input:
+                    node.complete_turn(stt_input, llm_text_buffer)
+
             # Update node data for legacy compatibility
             last_stored_event = last_event_data
 
@@ -438,7 +446,7 @@ class Turn:
 
     def _next_data(self, current, last_event):
         if current == "stt":
-            return [{"role": "user", "content": self.stt_text}]
+            return self.stt_text
         if current == "llm":
             return self.llm_text
         return None

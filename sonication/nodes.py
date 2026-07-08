@@ -142,26 +142,78 @@ class STTNode(Node):
 
 
 class LLMNode(Node):
-    """LLM. Handles messages + system prompt, yields tokens."""
+    """LLM. Handles messages + system prompt, yields tokens.
+
+    Context management:
+        The node maintains an internal conversation history starting with
+        the system prompt (if provided). Each call to stream() appends the
+        user message to history, sends the full history to the LLM, and
+        yields tokens. After the stream completes, call complete_turn()
+        to append the assistant response to history.
+
+    Usage:
+        node = LLMNode(url, system_prompt="You are helpful.")
+        await node.warmup()
+        full_response = ""
+        async for chunk in node.stream("Hello!"):
+            full_response += chunk.get("content", "")
+        node.complete_turn("Hello!", full_response)
+        # History now contains: system prompt + user message + assistant response
+    """
 
     _config_label = NodeConfigLabel.LLM_STREAMING
 
-    def __init__(self, base_url: str, api_key: str = "", db=None, system_prompt: str = ""):
+    def __init__(self, base_url: str, api_key: str = "", db=None,
+                 system_prompt: str = "", max_history: int = 50):
         super().__init__(base_url, api_key, db)
-        self.system_prompt: str = system_prompt
+        self.system_prompt = system_prompt
+        self.max_history = max_history
+        self._history: list[dict] = []
+        if system_prompt:
+            self._history.append({"role": "system", "content": system_prompt})
 
     def route(self) -> str:
         return "/v1/chat/completions"
 
-    async def stream(self, messages: list, **kwargs) -> AsyncIterator[dict]:
-        """Stream tokens with system prompt injected."""
-        all_messages = []
+    def complete_turn(self, user_message: str, assistant_response: str) -> None:
+        """Append the assistant response to conversation history.
+
+        This is called after stream() completes. The user message was
+        already appended by stream(). Only the assistant response needs
+        to be added here.
+        """
+        self._history.append({"role": "assistant", "content": assistant_response})
+        # Trim history to max_history to avoid unbounded growth
+        if len(self._history) > self.max_history:
+            # Keep system prompt + last max_history-1 messages
+            self._history = [self._history[0]] + self._history[-(self.max_history - 1):]
+
+    def get_history(self) -> list[dict]:
+        """Return the current conversation history."""
+        return list(self._history)
+
+    def clear_history(self) -> None:
+        """Clear conversation history, keeping only the system prompt."""
         if self.system_prompt:
-            all_messages.append({"role": "system", "content": self.system_prompt})
-        all_messages.extend(messages)
+            self._history = [{"role": "system", "content": self.system_prompt}]
+        else:
+            self._history = []
+
+    async def stream(self, user_message: str, **kwargs) -> AsyncIterator[dict]:
+        """Stream tokens for a single user message with context management.
+
+        Appends user_message to history, sends full history to LLM,
+        yields tokens. Call complete_turn() after streaming to persist
+        the assistant response.
+        """
+        self._history.append({"role": "user", "content": user_message})
+
+        # Trim history if needed (in case stream was called without complete_turn)
+        if len(self._history) > self.max_history:
+            self._history = [self._history[0]] + self._history[-(self.max_history - 1):]
 
         async for chunk in clients.stream_llm(
-            all_messages,
+            self._history,
             seed=kwargs.get("seed", config.LLM_SEED),
             temperature=kwargs.get("temperature", config.LLM_TEMPERATURE),
             max_tokens=kwargs.get("max_tokens", config.LLM_MAX_TOKENS),
