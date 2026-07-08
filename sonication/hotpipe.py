@@ -28,7 +28,7 @@ PING_INTERVAL = 5.0
 
 # Phrase gate config — sentences needed and chars minimum before gating
 PHRASE_MIN_CHARS = 20
-PHRASE_END_CHARS = {'.', '!', '?', '\n'}
+PHRASE_END_CHARS = {'.', '!', '?'}
 
 
 def _phrase_ready(text: str) -> bool:
@@ -87,14 +87,14 @@ class StageBoundaries:
     """Typed phase boundary anchors for a turn."""
 
     def __init__(self):
-        self.t_stt_req: Optional[object] = None
-        self.t_stt_resp: Optional[object] = None
-        self.t_llm_req: Optional[object] = None
-        self.t_llm_ttft: Optional[object] = None
-        self.t_llm_resp: Optional[object] = None
-        self.t_tts_req: Optional[object] = None
-        self.t_tts_ttfb: Optional[object] = None
-        self.t_tts_resp: Optional[object] = None
+        self.t_stt_req: Optional[PhaseBoundary] = None
+        self.t_stt_resp: Optional[PhaseBoundary] = None
+        self.t_llm_req: Optional[PhaseBoundary] = None
+        self.t_llm_ttft: Optional[PhaseBoundary] = None
+        self.t_llm_resp: Optional[PhaseBoundary] = None
+        self.t_tts_req: Optional[PhaseBoundary] = None
+        self.t_tts_ttfb: Optional[PhaseBoundary] = None
+        self.t_tts_resp: Optional[PhaseBoundary] = None
 
 
 class Turn:
@@ -116,8 +116,8 @@ class Turn:
         self.start_wall = start_wall_ms
         self.start_mono = start_mono_ms
         self.boundaries = StageBoundaries()
-        self.node_stages: Dict[str, object] = {}
-        self.inter_stage_events: List[object] = []
+        self.node_stages: Dict[str, NodeStageRecord] = {}
+        self.inter_stage_events: List[InterStageEvent] = []
         self.events: List[PipeEvent] = []
         # Legacy float fields (preserved for compat)
         self.stt_start_ms = 0.0
@@ -137,15 +137,15 @@ class Turn:
     def _now(self) -> float:
         return (time.monotonic() - self.start_mono) * 1000.0
 
-    def record_node_stage(self, record: object) -> None:
+    def record_node_stage(self, record: NodeStageRecord) -> None:
         """Register/update a node stage record."""
         self.node_stages[record.stage_id] = record
 
-    def record_inter_stage_event(self, event: object) -> None:
+    def record_inter_stage_event(self, event: InterStageEvent) -> None:
         """Register an inter-stage event."""
         self.inter_stage_events.append(event)
 
-    def boundary(self, name: str) -> Optional[object]:
+    def boundary(self, name: str) -> Optional[PhaseBoundary]:
         """Return the PhaseBoundary for a named anchor."""
         return getattr(self.boundaries, name, None)
 
@@ -172,8 +172,11 @@ class Turn:
         from .analysis import LatencyAnalyser
         return LatencyAnalyser.analyse(self)
 
-    async def turn(self, pipe, entry_point, data):
-        """Execute the pipeline from the entry node."""
+    async def run(self, pipe, data):
+        """Execute the pipeline from the entry node (auto-detected from topology)."""
+        # Auto-detect entry point from topology
+        entry_point = self._detect_entry_point(pipe)
+        
         self.events.append(PipeEvent.new(
             "turn_start", entry_point, self.turn_id, local_offset_ms=0.0))
 
@@ -201,6 +204,16 @@ class Turn:
             "llm_ttft_ms": self.llm_ttft_ms,
             "tts_ttfb_ms": self.tts_ttfb_ms,
         }
+
+    def _detect_entry_point(self, pipe) -> str:
+        """Auto-detect the entry node from pipeline topology."""
+        slots = pipe._pipeline_topology.get("slots", [])
+        if slots:
+            return slots[0]["slot_name"]
+        # Fallback: first node in topology connections
+        for conn in pipe._pipeline_topology.get("connections", []):
+            return conn[0]
+        return "stt"  # Default fallback
 
     async def _walk(self, pipe, node_name, data, parent_id=None):
         """Run a node, collect events, follow downstream connections,
@@ -246,6 +259,7 @@ class Turn:
         node_start_wc = time.time() * 1000
 
         last_event_type = None
+        last_event_data = None
         try:
             async for raw in node.stream(data):
                 # Log event with stage context
@@ -253,6 +267,7 @@ class Turn:
                 self._event_seq += 1
                 last_event_event_id = self.events[-1].event_id
                 last_event_type = raw.get("kind")
+                last_event_data = raw
 
                 # Record phase boundaries
                 self._record_phase_boundary(stage_record, raw, node_name, config_label)
@@ -262,10 +277,11 @@ class Turn:
                     llm_text_buffer += raw.get("content", "")
 
                 # Check phrase gate readiness
-                if node_name == "llm" and llm_text_buffer and config_label == NodeConfigLabel.LLM_STREAMING:
+                if node_name == "llm" and llm_text_buffer and config_label in (NodeConfigLabel.LLM_STREAMING, NodeConfigLabel.LLM_STREAMING_WITH_REASONING):
                     downstream_tts = any(
-                        pipe.nodes.get(n, ())[1] == NodeConfigLabel.TTS_CHUNK_IN_STREAM_OUT
-                        for n in pipe.connections.get(node_name, [])
+                        conn[0] == node_name
+                        and pipe.nodes.get(conn[1], ())[1] == NodeConfigLabel.TTS_CHUNK_IN_STREAM_OUT
+                        for conn in pipe._pipeline_topology.get("connections", [])
                     )
                     if downstream_tts and _phrase_ready(llm_text_buffer):
                         self._emit_phrase_gate_event(node_name, stage_id, llm_text_buffer)
@@ -274,7 +290,7 @@ class Turn:
             self._record_end_boundary(stage_record, node_name, node_start_wc)
 
             # Update node data for legacy compatibility
-            last_result = last_event_type
+            last_stored_event = last_event_data
 
         except Exception as e:
             self.events.append(PipeEvent.new(
@@ -287,7 +303,7 @@ class Turn:
 
         # Legacy data extraction (preserved for compat)
         if node_name == "stt" and last_event_type == "transcript":
-            self.stt_text = last_result.get("text", "") if isinstance(last_result, dict) else ""
+            self.stt_text = last_stored_event.get("text", "") if isinstance(last_stored_event, dict) else ""
         elif node_name == "tts":
             pass  # TTS audio stored in _node_data by HotPipe
 
@@ -388,7 +404,37 @@ class Turn:
 
     def _record_end_boundary(self, stage_record, node_name, start_wc):
         """Record end-phase boundaries after node stream completes."""
-        pass  # handled dynamically during streaming
+        now_ms = time.time() * 1000
+        if node_name == "stt" and self.boundaries.t_stt_resp is None:
+            pb = PhaseBoundary(
+                name="t_stt_resp",
+                wallclock_ms=now_ms,
+                local_offset_ms=self._now(),
+                event_id=self.events[-1].event_id if self.events else "",
+            )
+            self.boundaries.t_stt_resp = pb
+            stage_record.timing["t_stt_resp"] = now_ms
+            self.stt_done_ms = self._now()
+        elif node_name == "llm" and self.boundaries.t_llm_resp is None:
+            pb = PhaseBoundary(
+                name="t_llm_resp",
+                wallclock_ms=now_ms,
+                local_offset_ms=self._now(),
+                event_id=self.events[-1].event_id if self.events else "",
+            )
+            self.boundaries.t_llm_resp = pb
+            stage_record.timing["t_llm_resp"] = now_ms
+            self.llm_done_ms = self._now()
+        elif node_name == "tts" and self.boundaries.t_tts_resp is None:
+            pb = PhaseBoundary(
+                name="t_tts_resp",
+                wallclock_ms=now_ms,
+                local_offset_ms=self._now(),
+                event_id=self.events[-1].event_id if self.events else "",
+            )
+            self.boundaries.t_tts_resp = pb
+            stage_record.timing["t_tts_resp"] = now_ms
+            self.tts_done_ms = self._now()
 
     def _next_data(self, current, last_event):
         if current == "stt":
@@ -441,14 +487,14 @@ class Turn:
             seq=self._next_seq(),
             payload={
                 "warming_up": len(buffered_text) < 100,
-                "sentences": max(1, len(buffered_text.split("."))),
+                "sentences": max(1, len([c for c in buffered_text if c in ".!?"])),
                 "has_phrase_ready": True,
                 "buffered_text": buffered_text[:200],
             }
         ))
         try:
-            # insert_inter_stage_event(self.inter_stage_events[-1].__dict__)
-            pass  # inter_stage may not be set up yet
+            from .db import insert_inter_stage_event
+            insert_inter_stage_event(self.inter_stage_events[-1].__dict__)
         except Exception:
             pass
 
@@ -720,7 +766,7 @@ class HotPipe:
         turn = Turn(turn_id, start_wall, start_wall,
                     pipeline_type=self.pipeline_type.value if self.pipeline_type else pipeline_type)
         try:
-            return await turn.turn(self, entry_point, data)
+            return await turn.run(self, data)
         except Exception as e:
             logger.error(f"Turn {turn_id} failed: {e}")
             raise

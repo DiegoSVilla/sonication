@@ -133,8 +133,8 @@ class LatencyAnalyser:
         # LLM TTFT
         _add("llm_ttft", "t_llm_req", "t_llm_ttft", "service")
         
-        # Phrase gate gap: from LLM TTFT to TTS request
-        _add("phrase_gate", "t_tts_ttfb", "t_tts_req", "pipeline")
+        # Phrase gate gap: from LLM completion to TTS start
+        _add("phrase_gate", "t_llm_resp", "t_tts_req", "pipeline")
         
         # TTS TTFB
         _add("tts_ttfb", "t_tts_req", "t_tts_ttfb", "service")
