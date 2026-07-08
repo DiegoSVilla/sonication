@@ -3,6 +3,7 @@
 A VoiceCall owns the call clock, event recorder, and the STT -> LLM -> TTS
 pipeline. It handles text-in -> LLM -> TTS -> audio-out minimally.
 """
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -40,8 +41,9 @@ class VoiceCall:
         )
         return now, params
 
-    def end(self) -> None:
-        """End the call and record call_end."""
+    async def end(self) -> None:
+        """End the call, record call_end, and close the HTTP client."""
         self.rec.record(events.CALL_END, {}, t_ms=self.clock.now_ms())
+        await self.pipeline.close()
 
 

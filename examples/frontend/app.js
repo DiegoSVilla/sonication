@@ -202,6 +202,7 @@ function handle(msg) {
     case "response":
       bubble("user", msg.stt_text || "(no speech detected)");
       bubble("assistant", msg.llm_response || "");
+      ttsPlayCursor = audioCtx ? audioCtx.currentTime : 0;
       if (msg.tts_audio_b64) {
         playTtsChunk({ pcm_b64: msg.tts_audio_b64, turn_index: msg.turn_index });
       }

@@ -16,7 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import sonication
-from sonication import clients
+from sonication import client
 from sonication import config
 
 
@@ -110,7 +110,13 @@ async def test_pipeline_turn(text: str, turn_num: int) -> dict:
     # Step 3: Run the turn through the pipeline
     print("  [3/5] Running pipeline turn...")
     try:
-        result = await pipeline.turn("stt", pcm_bytes)
+        results = []
+        async for result in pipeline.turn("stt", pcm_bytes):
+            results.append(result)
+        if results:
+            result = results[0]
+        else:
+            result = {}
     except Exception as e:
         print(f"  ✗ Pipeline error: {e}")
         import traceback
@@ -181,7 +187,7 @@ async def test_stt_node_directly() -> dict:
 
     # Generate short TTS audio
     pcm_chunks = []
-    async for chunk in clients.stream_tts("hello", "ryan", "English"):
+    async for chunk in client.stream_tts("hello", "ryan", "English"):
         if chunk.get("kind") == "audio":
             pcm_data = chunk.get("pcm", b"")
             if pcm_data:

@@ -66,7 +66,10 @@ async def main():
         text_pipe.connect()
         
         # Run turn with text
-        result = await text_pipe.turn("llm", [{"role": "user", "content": "Hello!"}])
+        results = []
+        async for result in text_pipe.turn("llm", [{"role": "user", "content": "Hello!"}]):
+            results.append(result)
+        result = results[0] if results else {}
         
         print(f"\nResult:")
         print(f"  stt_text: {result['stt_text']}")

@@ -17,6 +17,7 @@ import asyncio
 import base64
 import io
 import logging
+import os
 import wave
 from pathlib import Path
 from typing import Optional
@@ -55,9 +56,9 @@ class PizzaAgent:
 
     def __init__(
         self,
-        stt_url: str = "http://localhost:8092",
-        llm_url: str = "http://localhost:8093",
-        tts_url: str = "http://localhost:8094",
+        stt_url: str = "http://127.0.0.1:8092",
+        llm_url: str = "http://192.168.15.6:8000",
+        tts_url: str = "http://127.0.0.1:8091",
     ):
         self.stt_url = stt_url
         self.llm_url = llm_url
@@ -67,12 +68,14 @@ class PizzaAgent:
         self.stt_node = sonication.STTNode(stt_url, sample_rate=16000, input_format="wav")
         self.llm_node = sonication.LLMNode(
             llm_url,
+            api_key=os.environ.get("LLM_API_KEY", ""),
             system_prompt=PIZZA_SYSTEM_PROMPT,
         )
-        self.tts_node = sonication.TTSNode(tts_url, voice="ryan", language="English")
+        self.tts_node = sonication.TTSNode(tts_url, voice="Ryan", language="English")
 
         # Create pipeline — context management is internal to LLMNode
         self.log_manager = sonication.LogManager(db_path="data/calls.db")
+        self.log_manager.start()
         self.pipeline = sonication.HotPipe(
             pipeline_type=sonication.PipelineType.SI_SO_THREE_STEP_PIPELINE_CHAT,
             log_manager=self.log_manager,
@@ -90,34 +93,73 @@ class PizzaAgent:
         await self.pipeline.warmup()
         logger.info("All nodes warm.")
 
-    async def run_turn(self, audio_bytes: bytes, session_id: str = "") -> dict:
-        """Process one turn (audio input) and return results."""
+    async def run_turn(self, audio_bytes: bytes, session_id: str = "",
+                       stream_events: bool = False) -> dict:
+        """Process one turn (audio input) and return results.
+        
+        Args:
+            audio_bytes: Input audio bytes.
+            session_id: Session identifier.
+            stream_events: If True, returns dict with all events.
+                          If False (default), returns aggregated response.
+        """
         self.turn_count += 1
         logger.info(f"Processing turn {self.turn_count} [session={session_id}]...")
 
-        result = await self.pipeline.turn("stt", audio_bytes)
+        if stream_events:
+            events = []
+            async for event in self.pipeline.turn("stt", audio_bytes, stream_events=True):
+                events.append(event)
+                logger.info(f"Event: {event['type']} ({event['local_offset_ms']:.0f}ms)")
+            
+            # Extract results from turn_complete event
+            turn_complete = None
+            for event in events:
+                if event["type"] == "turn_complete":
+                    turn_complete = event
+                    break
+            
+            return {
+                "type": "response",
+                "turn_index": self.turn_count,
+                "events": events,
+                "stt_text": turn_complete["payload"].get("stt_text", "") if turn_complete else "",
+                "llm_response": turn_complete["payload"].get("llm_response", "") if turn_complete else "",
+                "tts_audio_b64": "",
+                "shot_latency_ms": turn_complete["payload"].get("shot_latency_ms", 0) if turn_complete else 0,
+                "segments": turn_complete["payload"].get("segments", []) if turn_complete else [],
+            }
+        else:
+            results = []
+            async for result in self.pipeline.turn("stt", audio_bytes):
+                results.append(result)
+            
+            if results:
+                result = results[0]
+            else:
+                result = {}
 
-        # Build analysis segments from the turn
-        try:
-            last_turn = self.pipeline._last_turn
-            if last_turn:
-                analysis = last_turn.analyse()
-                segments = [
-                    {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
-                    for s in analysis.segments
-                ]
-        except Exception:
-            segments = []
+            # Build analysis segments from the turn
+            try:
+                last_turn = self.pipeline._last_turn
+                if last_turn:
+                    analysis = last_turn.analyse()
+                    segments = [
+                        {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
+                        for s in analysis.segments
+                    ]
+            except Exception:
+                segments = []
 
-        return {
-            "type": "response",
-            "turn_index": self.turn_count,
-            "stt_text": result.get("stt_text", ""),
-            "llm_response": result.get("llm_response", ""),
-            "tts_audio_b64": base64.b64encode(result.get("tts_audio", b"")).decode("ascii") if result.get("tts_audio") else "",
-            "shot_latency_ms": result.get("shot_latency_ms", 0),
-            "segments": segments,
-        }
+            return {
+                "type": "response",
+                "turn_index": self.turn_count,
+                "stt_text": result.get("stt_text", ""),
+                "llm_response": result.get("llm_response", ""),
+                "tts_audio_b64": base64.b64encode(result.get("tts_audio", b"")).decode("ascii") if result.get("tts_audio") else "",
+                "shot_latency_ms": result.get("shot_latency_ms", 0),
+                "segments": segments,
+            }
 
     def get_stats(self) -> dict:
         """Return pipeline statistics."""

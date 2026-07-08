@@ -30,6 +30,8 @@ PING_INTERVAL = 5.0
 PHRASE_MIN_CHARS = 20
 PHRASE_END_CHARS = {'.', '!', '?'}
 
+from .db import log_keep_warm_ping
+
 
 def _phrase_ready(text: str) -> bool:
     """Check if accumulated LLM text is ready for phrase gating."""
@@ -45,42 +47,60 @@ def _phrase_ready(text: str) -> bool:
 class PingLoop:
     """Background keepalive ping loop.
 
-    Periodically sends a lightweight /health request to each node to keep
-    pooled HTTP connections warm. Matches minimalVoice's EndpointMonitor.
+    Periodically sends a lightweight /ping request to each node to keep
+    pooled HTTP connections warm. Auto-starts on connect()/turn() and
+    stops after keep_warm_duration seconds of inactivity.
     """
 
-    def __init__(self, nodes: dict, nodes_health: Optional[dict] = None):
+    def __init__(self, nodes: dict, keep_warm_duration: float = 30.0, ping_interval: float = 5.0):
         self._nodes = nodes
-        self._nodes_health = nodes_health or {}
+        self._keep_warm_duration = keep_warm_duration
+        self._ping_interval = ping_interval
+        self._last_turn_time: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
+        self._stopped = False
+        self._started = False
 
-    async def start(self):
-        if self._task is None:
+    def _ensure_started(self):
+        """Start the background task if not already running."""
+        if not self._started:
             self._task = asyncio.create_task(self._loop())
+            self._started = True
+
+    def touch(self):
+        """Reset keep-warm timer and ensure ping loop is running."""
+        self._last_turn_time = time.time()
+        self._ensure_started()
 
     async def stop(self):
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        """Stop pings immediately."""
+        self._stopped = True
+        if self._task and self._task != asyncio.current_task():
+            await self._task
             self._task = None
 
     async def _loop(self):
-        while True:
+        while not self._stopped:
+            # Check if keep-warm duration expired
+            if self._last_turn_time and \
+               (time.time() - self._last_turn_time) > self._keep_warm_duration:
+                await self.stop()
+                break
+                
             for name, (node, _) in self._nodes.items():
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(connect=5.0, read=10.0)
-                    ) as c:
-                        r = await c.get(f"{node.base_url}/health")
-                        if self._nodes_health:
-                            rtt_ms = r.elapsed.total_seconds() * 1000
-                            self._nodes_health.setdefault(name, []).append(rtt_ms)
-                except (Exception, asyncio.TimeoutError):
+                    # REUSE node.connection (not ephemeral client)
+                    if node.connection:
+                        r = await node.connection.get(
+                            f"{node.base_url}/ping",
+                            headers=node._auth_headers()
+                        )
+                        rtt_ms = r.elapsed.total_seconds() * 1000
+                        # Log to DB (parent_turn_id=None per AGENTS.md 1.10)
+                        log_keep_warm_ping(name, time.time()*1000, rtt_ms, parent_turn_id=None)
+                except Exception:
                     pass
-            await asyncio.sleep(PING_INTERVAL)
+            await asyncio.sleep(self._ping_interval)
 
 
 class StageBoundaries:
@@ -174,36 +194,9 @@ class Turn:
 
     async def run(self, pipe, data):
         """Execute the pipeline from the entry node (auto-detected from topology)."""
-        # Store log_manager reference for _enqueue_event
-        self._log_manager = pipe._log_manager
-        
-        # Auto-detect entry point from topology
-        entry_point = self._detect_entry_point(pipe)
-        
-        self.events.append(PipeEvent.new(
-            "turn_start", entry_point, self.turn_id, local_offset_ms=0.0))
-
-        # Also record pipeline_start as inter-stage event
-        self.inter_stage_events.append(InterStageEvent(
-            event_type="turn_start",
-            wallclock_ms=time.time() * 1000,
-            local_offset_ms=self._now(),
-            payload={"pipeline_type": self._pipeline_type, "entry_node": entry_point}
-        ))
-        if self._log_manager:
-            self._log_manager.enqueue({
-                "_log_kind": "inter_stage",
-                **self.inter_stage_events[-1].__dict__,
-            })
-        
-        try:
-            await self._walk(pipe, entry_point, data)
-        except Exception as e:
-            self.events.append(PipeEvent.new(
-                "turn_error", entry_point, self.turn_id,
-                payload={"error": str(e)}))
-            raise
-
+        # Collect all events (run_events is a generator)
+        async for event in self.run_events(pipe, data):
+            pass
         return {
             "stt_text": self.stt_text,
             "llm_response": self.llm_text,
@@ -212,6 +205,84 @@ class Turn:
             "stt_ms": self.stt_done_ms - self.stt_start_ms,
             "llm_ttft_ms": self.llm_ttft_ms,
             "tts_ttfb_ms": self.tts_ttfb_ms,
+        }
+
+    async def run_events(self, pipe, data):
+        """Execute the pipeline and yield all events with timestamps in real-time.
+        
+        Yields event dicts with:
+            - type: event type (turn_start, node_start, stt_transcript, llm_token, etc.)
+            - turn_id: unique turn identifier
+            - stage_id: node stage identifier
+            - node_name: which node produced the event
+            - wallclock_ms: absolute Unix timestamp
+            - local_offset_ms: milliseconds since turn start
+            - payload: node-specific data
+            - seq: sequence number
+        
+        Final event is "turn_complete" with aggregated results:
+            - stt_text, llm_response, tts_audio, shot_latency_ms, segments
+        """
+        self._log_manager = pipe._log_manager
+        entry_point = self._detect_entry_point(pipe)
+        self._phrase_gate_emitted = False
+        
+        # Yield turn_start
+        yield self._make_event_dict(
+            "turn_start", entry_point, self.turn_id,
+            local_offset_ms=0.0,
+            payload={"pipeline_type": self._pipeline_type, "entry_node": entry_point},
+            stage_id="", seq=0
+        )
+        
+        try:
+            async for event in self._walk_events(pipe, entry_point, data):
+                yield event
+        except Exception as e:
+            yield self._make_event_dict(
+                "turn_error", entry_point, self.turn_id,
+                payload={"error": str(e)}
+            )
+            raise
+        
+        # Build segments for turn_complete
+        segments = []
+        try:
+            analysis = self.analyse()
+            segments = [
+                {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
+                for s in analysis.segments
+            ]
+        except Exception:
+            pass
+        
+        # Yield turn_complete with aggregated results
+        yield self._make_event_dict(
+            "turn_complete", entry_point, self.turn_id,
+            payload={
+                "stt_text": self.stt_text,
+                "llm_response": self.llm_text,
+                "tts_audio": self.tts_audio,
+                "shot_latency_ms": self.shot_latency_ms(),
+                "stt_ms": self.stt_done_ms - self.stt_start_ms,
+                "llm_ttft_ms": self.llm_ttft_ms,
+                "tts_ttfb_ms": self.tts_ttfb_ms,
+                "segments": segments,
+            }
+        )
+
+    def _make_event_dict(self, event_type, node_name, turn_id, local_offset_ms=0.0,
+                         payload=None, stage_id="", seq=0):
+        """Create a standardized event dict for streaming."""
+        return {
+            "type": event_type,
+            "turn_id": turn_id,
+            "stage_id": stage_id,
+            "node_name": node_name,
+            "wallclock_ms": time.time() * 1000,
+            "local_offset_ms": local_offset_ms,
+            "payload": payload or {},
+            "seq": seq,
         }
 
     def _detect_entry_point(self, pipe) -> str:
@@ -299,15 +370,18 @@ class Turn:
                 if node_name == "stt" and raw.get("kind") == "transcript":
                     self.stt_text = raw.get("text", "")
 
-                # Check phrase gate readiness
+                # Check phrase gate readiness — only emit once per LLM stage
                 if node_name == "llm" and llm_text_buffer and config_label in (NodeConfigLabel.LLM_STREAMING, NodeConfigLabel.LLM_STREAMING_WITH_REASONING):
+                    if not hasattr(self, '_phrase_gate_emitted'):
+                        self._phrase_gate_emitted = False
                     downstream_tts = any(
                         conn[0] == node_name
                         and pipe.nodes.get(conn[1], ())[1] == NodeConfigLabel.TTS_CHUNK_IN_STREAM_OUT
                         for conn in pipe._pipeline_topology.get("connections", [])
                     )
-                    if downstream_tts and _phrase_ready(llm_text_buffer):
+                    if downstream_tts and not self._phrase_gate_emitted and _phrase_ready(llm_text_buffer):
                         self._emit_phrase_gate_event(node_name, stage_id, llm_text_buffer)
+                        self._phrase_gate_emitted = True
 
             # After stream completes — record end boundaries
             self._record_end_boundary(stage_record, node_name, node_start_wc)
@@ -335,6 +409,24 @@ class Turn:
         finally:
             stage_record.end_wall_ms = time.time() * 1000
             self.record_node_stage(stage_record)
+            
+            # Enqueue node_stage to log_manager
+            if self._log_manager:
+                logger.info(f"Enqueueing node_stage: {stage_record.node_name} turn_id={self.turn_id}")
+                self._log_manager.enqueue({
+                    "_log_kind": "node_stage",
+                    "stage_id": stage_record.stage_id,
+                    "turn_id": self.turn_id,
+                    "session_id": None,
+                    "conversation_id": None,
+                    "node_name": stage_record.node_name,
+                    "node_class": stage_record.node_class,
+                    "config_label": stage_record.config_label,
+                    "start_wall_ms": stage_record.start_wall_ms,
+                    "end_wall_ms": stage_record.end_wall_ms,
+                    "timing": stage_record.timing,
+                    "summary": {},
+                })
 
         # Legacy data extraction (preserved for compat)
         if node_name == "tts":
@@ -476,6 +568,178 @@ class Turn:
             return self.llm_text
         return None
 
+    async def _walk_events(self, pipe, node_name, data, parent_id=None):
+        """Async generator that walks the pipeline and yields events in real-time."""
+        node, category = pipe.nodes[node_name]
+        config_label = node.config_label if hasattr(node, 'config_label') else category
+        
+        stage_id = pipe._generate_stage_id(node, node_name)
+        node._stage_id = stage_id
+
+        stage_record = NodeStageRecord(
+            stage_id=stage_id,
+            node_name=node_name,
+            node_class=node.node_class,
+            config_label=config_label,
+            start_wall_ms=time.time() * 1000,
+            end_wall_ms=None,
+            timing={},
+            events=[],
+            payload_kind="unknown",
+        )
+        self.record_node_stage(stage_record)
+
+        llm_text_buffer = ""
+        tts_audio_chunks = []
+
+        # Yield node_start
+        seq = self._next_seq()
+        yield self._make_event_dict(
+            f"{node_name}_start", node_name, self.turn_id,
+            local_offset_ms=self._now(),
+            payload={"category": category, "config_label": config_label},
+            stage_id=stage_id, seq=seq
+        )
+        
+        node_start_wc = time.time() * 1000
+        last_event_event_id = None
+        last_event_type = None
+        last_event_data = None
+        
+        try:
+            async for raw in node.stream(data):
+                kind = raw.get("kind", "unknown")
+                
+                # Determine event type
+                if node_name == "stt":
+                    etype = {"transcript": "stt_transcript", "error": f"stt_{kind}",
+                             "done": "stt_done"}.get(kind, f"stt_{kind}")
+                elif node_name == "llm":
+                    etype = {"token": "llm_token", "reasoning": "llm_reasoning",
+                             "error": f"llm_{kind}", "done": "llm_done",
+                             "usage": "llm_usage"}.get(kind, f"llm_{kind}")
+                elif node_name == "tts":
+                    etype = {"audio": "tts_audio_chunk", "usage": "tts_usage",
+                             "error": f"tts_{kind}", "done": "tts_done"}.get(kind,
+                             f"tts_{kind}")
+                else:
+                    etype = f"{node_name}_{kind}"
+                
+                # Log to DB
+                await self._log_event(raw, node_name, parent_id, stage_id=stage_id, seq=seq)
+                self._event_seq += 1
+                last_event_event_id = None  # events list not used in streaming mode
+                last_event_type = kind
+                last_event_data = raw
+
+                # Record phase boundaries
+                self._record_phase_boundary(stage_record, raw, node_name, config_label)
+
+                # Accumulate LLM text
+                if "content" in raw and node_name == "llm":
+                    llm_text_buffer += raw.get("content", "")
+
+                # Capture TTS audio chunks
+                if node_name == "tts" and kind == "audio":
+                    pcm_data = raw.get("pcm", b"")
+                    if pcm_data:
+                        tts_audio_chunks.append(pcm_data)
+
+                # Capture STT transcript
+                if node_name == "stt" and kind == "transcript":
+                    self.stt_text = raw.get("text", "")
+
+                # Yield the event
+                yield self._make_event_dict(
+                    etype, node_name, self.turn_id,
+                    local_offset_ms=self._now(),
+                    payload=raw,
+                    stage_id=stage_id, seq=self._event_seq
+                )
+
+                # Check phrase gate readiness
+                if node_name == "llm" and llm_text_buffer and config_label in (NodeConfigLabel.LLM_STREAMING, NodeConfigLabel.LLM_STREAMING_WITH_REASONING):
+                    if not hasattr(self, '_phrase_gate_emitted'):
+                        self._phrase_gate_emitted = False
+                    downstream_tts = any(
+                        conn[0] == node_name
+                        and pipe.nodes.get(conn[1], ())[1] == NodeConfigLabel.TTS_CHUNK_IN_STREAM_OUT
+                        for conn in pipe._pipeline_topology.get("connections", [])
+                    )
+                    if downstream_tts and not self._phrase_gate_emitted and _phrase_ready(llm_text_buffer):
+                        # Yield phrase_gate
+                        ts = time.time() * 1000
+                        yield self._make_event_dict(
+                            "phrase_gate", node_name, self.turn_id,
+                            local_offset_ms=self._now(),
+                            payload={
+                                "accumulated_text": llm_text_buffer,
+                                "from_stage_id": stage_id,
+                            },
+                            stage_id=stage_id, seq=self._event_seq
+                        )
+                        self._phrase_gate_emitted = True
+
+            # After stream completes
+            self._record_end_boundary(stage_record, node_name, node_start_wc)
+
+            # Yield node_done
+            yield self._make_event_dict(
+                f"{node_name}_done", node_name, self.turn_id,
+                local_offset_ms=self._now(),
+                payload={},
+                stage_id=stage_id, seq=self._event_seq
+            )
+
+            # Store accumulated results
+            if node_name == "llm":
+                self.llm_text = llm_text_buffer
+                stt_input = self.stt_text
+                if hasattr(node, 'complete_turn') and stt_input:
+                    node.complete_turn(stt_input, llm_text_buffer)
+
+            if node_name == "tts" and tts_audio_chunks:
+                self.tts_audio = b"".join(tts_audio_chunks)
+
+            # Enqueue node_stage to log_manager
+            stage_record.end_wall_ms = time.time() * 1000
+            self.record_node_stage(stage_record)
+            if self._log_manager:
+                logger.info(f"Enqueueing node_stage: {stage_record.node_name} turn_id={self.turn_id}")
+                self._log_manager.enqueue({
+                    "_log_kind": "node_stage",
+                    "stage_id": stage_record.stage_id,
+                    "turn_id": self.turn_id,
+                    "session_id": None,
+                    "conversation_id": None,
+                    "node_name": stage_record.node_name,
+                    "node_class": stage_record.node_class,
+                    "config_label": stage_record.config_label,
+                    "start_wall_ms": stage_record.start_wall_ms,
+                    "end_wall_ms": stage_record.end_wall_ms,
+                    "timing": stage_record.timing,
+                    "summary": {},
+                })
+
+            # Follow downstream connections
+            for next_name in pipe.connections.get(node_name, []):
+                next_data = self._next_data(node_name, last_event_type)
+                if next_data is not None:
+                    async for event in self._walk_events(pipe, next_name, next_data,
+                                                         parent_id=last_event_event_id):
+                        yield event
+
+        except Exception as e:
+            yield self._make_event_dict(
+                f"{node_name}_error", node_name, self.turn_id,
+                payload={"error": str(e)}
+            )
+            raise
+        finally:
+            if not stage_record.end_wall_ms:
+                stage_record.end_wall_ms = time.time() * 1000
+                self.record_node_stage(stage_record)
+
     async def _log_event(self, raw, node_name, parent_id=None, stage_id="", seq=0):
         """Log a node event to events list and queue (or skip if no log_manager)."""
         kind = raw.get("kind", "unknown")
@@ -530,7 +794,8 @@ class Turn:
                 "sentences": max(1, len([c for c in buffered_text if c in ".!?"])),
                 "has_phrase_ready": True,
                 "buffered_text": buffered_text[:200],
-            }
+            },
+            turn_id=self.turn_id,
         ))
         # Enqueue via log_manager if available
         if self._log_manager:
@@ -627,13 +892,17 @@ class HotPipe:
         },
     }
 
-    def __init__(self, pipeline_type: PipelineType, log_manager=None):
+    def __init__(self, pipeline_type: PipelineType, log_manager=None,
+                 keep_warm_duration: float = 30.0, ping_interval: float = 5.0):
         """Pipeline type is REQUIRED at init.
         
         Args:
             pipeline_type: The pipeline topology to use.
             log_manager: Optional LogManager instance for event logging.
                         If None, all logging is disabled.
+            keep_warm_duration: Seconds of inactivity after which the
+                               keep-alive ping loop stops (default 30s).
+            ping_interval: Seconds between pings (default 5s).
         """
         if not pipeline_type:
             raise ValueError(
@@ -641,6 +910,8 @@ class HotPipe:
 
         self.pipeline_type = pipeline_type
         self._log_manager = log_manager
+        self._keep_warm_duration = keep_warm_duration
+        self._ping_interval = ping_interval
         
         # _slots maps slot_name -> Node instance
         self._slots: Dict[str, Any] = {}
@@ -797,6 +1068,12 @@ class HotPipe:
                 if hasattr(node, 'log_manager'):
                     node.log_manager = self._log_manager
         
+        # Initialize ping loop and warm up all node connections
+        self._ping_loop = PingLoop(self.nodes, self._keep_warm_duration, self._ping_interval)
+        for node, _ in self.nodes.values():
+            asyncio.create_task(node.warmup())
+        self._ping_loop.touch()
+        
         return True
 
     def _generate_stage_id(self, node: object, node_name: str) -> str:
@@ -814,26 +1091,25 @@ class HotPipe:
         node_id = str(uuid.uuid4())[:8]
         return f"{node_name}_{node_id}_{label}_{step}"
 
-    async def start(self):
-        """Start the HotPipe and begin background keepalive pings."""
-        self._ping_loop = PingLoop(self.nodes, self._nodes_health)
-        await self._ping_loop.start()
-
-    async def stop(self):
-        """Stop the HotPipe and cancel background pings."""
-        if self._ping_loop:
-            await self._ping_loop.stop()
-
     async def warmup(self):
-        """Ping all nodes to establish keepalive connections."""
+        """Ping all nodes to establish keepalive connections.
+        
+        Deprecated: connections are now established in connect().
+        This method is kept for backward compatibility.
+        """
         results = []
         for node, _ in self.nodes.values():
             results.append(await node.warmup())
         warm = sum(1 for r in results if r)
         logger.info(f"Warmup: {warm}/{len(self.nodes)} nodes warm")
+        if self._ping_loop:
+            self._ping_loop.touch()
         return results
 
     async def close(self):
+        """Close all node connections and stop ping loop."""
+        if self._ping_loop:
+            await self._ping_loop.stop()
         for node, _ in self.nodes.values():
             await node.close()
 
@@ -842,20 +1118,51 @@ class HotPipe:
             "nodes": list(self.nodes.keys()),
             "connections": dict(self.connections),
             "node_warming": {n: node.is_warm for n, (node, _) in self.nodes.items()},
-            "health_sample": {n: (round(history[-1]) if history else None)
-                              for n, history in self._nodes_health.items()},
         }
 
-    async def turn(self, entry_point: str, data, pipeline_type: str = "manual"):
-        """Execute one turn. Returns dict with results."""
+    async def turn(self, entry_point: str, data, pipeline_type: str = "manual",
+                   stream_events: bool = False):
+        """Execute one turn.
+        
+        Always returns an async generator yielding event dicts.
+        
+        Args:
+            entry_point: Node name to start from (e.g., "stt").
+            data: Input data for the entry node.
+            pipeline_type: Override pipeline type detection.
+            stream_events: If True, yields individual events (stt_transcript,
+                          llm_token, tts_audio_chunk, etc.) plus turn_complete.
+                          If False (default), yields a single dict with aggregated
+                          results.
+        
+        Yields:
+            If stream_events=True: event dicts with type, turn_id, stage_id,
+                                  node_name, wallclock_ms, local_offset_ms,
+                                  payload, seq
+            If stream_events=False: single dict with stt_text, llm_response,
+                                   tts_audio, shot_latency_ms, etc.
+        """
+        # Start/refresh ping loop
+        if not self._ping_loop:
+            self._ping_loop = PingLoop(
+                self.nodes, self._keep_warm_duration, self._ping_interval
+            )
+        self._ping_loop.touch()
+        
         turn_id = f"turn_{round(time.time() * 1000)}"
         start_wall = time.time() * 1000
-        turn = Turn(turn_id, start_wall, start_wall,
+        start_mono = time.monotonic()
+        turn = Turn(turn_id, start_wall, start_mono,
                     pipeline_type=self.pipeline_type.value if self.pipeline_type else pipeline_type)
+        self._last_turn = turn
+        
         try:
-            result = await turn.run(self, data)
-            self._last_turn = turn
-            return result
+            if stream_events:
+                async for event in turn.run_events(self, data):
+                    yield event
+            else:
+                result = await turn.run(self, data)
+                yield result
         except Exception as e:
             logger.error(f"Turn {turn_id} failed: {e}")
             raise

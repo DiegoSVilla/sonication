@@ -180,6 +180,19 @@ class LogManager:
         if not self._conn:
             return
 
+        def _make_payload_json_safe(payload: dict) -> dict:
+            """Convert bytes to base64 in payload for JSON serialization."""
+            import base64
+            safe = {}
+            for k, v in payload.items():
+                if isinstance(v, bytes):
+                    safe[k] = base64.b64encode(v).decode("ascii")
+                elif isinstance(v, dict):
+                    safe[k] = _make_payload_json_safe(v)
+                else:
+                    safe[k] = v
+            return safe
+
         # Separate events by table
         pipe_events = []
         node_stages = []
@@ -215,7 +228,7 @@ class LogManager:
                         e.get("turn_id"),
                         e.get("timestamp_wallclock_ms") or e.get("wallclock_ms"),
                         e.get("timestamp_local_offset") or e.get("local_offset_ms"),
-                        json.dumps(e.get("payload", {})),
+                        json.dumps(_make_payload_json_safe(e.get("payload", {}))),
                         e.get("parent_event_id"),
                         e.get("stage_id"),
                         e.get("seq"),
@@ -270,7 +283,7 @@ class LogManager:
                         e.get("seq"),
                         e.get("from_stage_id"),
                         e.get("to_stage_id"),
-                        json.dumps(e.get("payload", {})),
+                        json.dumps(_make_payload_json_safe(e.get("payload", {}))),
                     )
                     for e in inter_stage_events
                 ],
@@ -309,7 +322,7 @@ class LogManager:
                         e.get("turn_id"),
                         e.get("wallclock_ms") or e.get("timestamp_wallclock_ms"),
                         e.get("local_offset_ms") or e.get("timestamp_local_offset"),
-                        json.dumps(e.get("payload", {})),
+                        json.dumps(_make_payload_json_safe(e.get("payload", {}))),
                         e.get("parent_event_id"),
                         e.get("stage_id"),
                         e.get("seq"),

@@ -174,3 +174,4 @@ class InterStageEvent:
     parent_event_id: _Optional[str] = None
     from_stage_id: _Optional[str] = None
     to_stage_id: _Optional[str] = None
+    turn_id: _Optional[str] = None

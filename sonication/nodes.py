@@ -20,7 +20,7 @@ from typing import AsyncIterator, Optional
 
 import httpx
 
-from . import clients
+from . import client
 from . import config
 from .node_types import NodeConfigLabel
 
@@ -51,15 +51,18 @@ class Node:
 
     def _auth_headers(self) -> dict:
         """Build auth headers from api_key."""
-        return clients.config.bearer(self.api_key) if self.api_key else {}
+        return config.bearer(self.api_key) if self.api_key else {}
 
     async def warmup(self, timeout: float = 5.0) -> bool:
         """Establish keepalive connection via /ping."""
         if not self.connection:
-            self.connection = httpx.AsyncClient(timeout=clients._timeout, limits=clients._limits)
+            self.connection = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+                limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60.0)
+            )
         try:
             resp = await asyncio.wait_for(
-                self.connection.get(f"{self.base_url}/ping"),
+                self.connection.get(f"{self.base_url}/ping", headers=self._auth_headers()),
                 timeout=timeout,
             )
             if resp.status_code == 200:
@@ -154,8 +157,9 @@ class STTNode(Node):
                 logger.info(f"STTNode.stream: {len(audio_bytes)} bytes, is_wav={is_wav}, sample_rate_hint={int.from_bytes(audio_bytes[24:28], 'little') if len(audio_bytes) >= 28 else '?'}")
                 if not is_wav:
                     logger.warning(f"STTNode.stream: WAV format but no RIFF header! First 8 bytes: {audio_bytes[:8].hex()}")
-                result = await clients.transcribe(audio_bytes, filename="audio.wav",
-                                                   content_type="audio/wav", language=lang)
+                result = await client.transcribe(audio_bytes, filename="audio.wav",
+                                                    content_type="audio/wav", language=lang,
+                                                    client=self.connection)
 
             elif fmt == "pcm":
                 # Raw 16-bit PCM — wrap in WAV with configured sample_rate
@@ -167,13 +171,15 @@ class STTNode(Node):
                     wf.setframerate(self.sample_rate)
                     wf.writeframes(audio_bytes)
                 wav_bytes = wav_buf.getvalue()
-                result = await clients.transcribe(wav_bytes, filename="audio.wav",
-                                                   content_type="audio/wav", language=lang)
+                result = await client.transcribe(wav_bytes, filename="audio.wav",
+                                                    content_type="audio/wav", language=lang,
+                                                    client=self.connection)
 
             elif fmt == "flac":
                 logger.info(f"STTNode.stream: {len(audio_bytes)} bytes FLAC")
-                result = await clients.transcribe(audio_bytes, filename="audio.flac",
-                                                   content_type="audio/flac", language=lang)
+                result = await client.transcribe(audio_bytes, filename="audio.flac",
+                                                    content_type="audio/flac", language=lang,
+                                                    client=self.connection)
 
             else:
                 raise ValueError(f"STTNode: unsupported input_format='{fmt}'. Use 'wav', 'pcm', or 'flac'.")
@@ -259,12 +265,13 @@ class LLMNode(Node):
         if len(self._history) > self.max_history:
             self._history = [self._history[0]] + self._history[-(self.max_history - 1):]
 
-        async for chunk in clients.stream_llm(
+        async for chunk in client.stream_llm(
             self._history,
             seed=kwargs.get("seed", config.LLM_SEED),
             temperature=kwargs.get("temperature", config.LLM_TEMPERATURE),
             max_tokens=kwargs.get("max_tokens", config.LLM_MAX_TOKENS),
             enable_thinking=kwargs.get("enable_thinking", config.LLM_ENABLE_THINKING),
+            client=self.connection,
         ):
             yield chunk
 
@@ -287,5 +294,5 @@ class TTSNode(Node):
         """Stream audio chunks."""
         voice = voice or self.voice
         language = language or self.language
-        async for chunk in clients.stream_tts(text, voice, language):
+        async for chunk in client.stream_tts(text, voice, language, client=self.connection):
             yield chunk
