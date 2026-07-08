@@ -108,26 +108,23 @@ class PizzaAgent:
 
         if stream_events:
             events = []
+            turn_complete = None
             async for event in self.pipeline.turn("stt", audio_bytes, stream_events=True):
                 events.append(event)
-                logger.info(f"Event: {event['type']} ({event['local_offset_ms']:.0f}ms)")
-            
-            # Extract results from turn_complete event
-            turn_complete = None
-            for event in events:
-                if event["type"] == "turn_complete":
+                logger.info(f"Event: {event.get('event_type')} ({event.get('emitter_node')}) @ {event.get('local_offset_ms', 0):.0f}ms")
+                if event.get("event_type") == "turn_complete":
                     turn_complete = event
-                    break
             
+            payload = turn_complete.get("payload", {}) if turn_complete else {}
             return {
                 "type": "response",
                 "turn_index": self.turn_count,
                 "events": events,
-                "stt_text": turn_complete["payload"].get("stt_text", "") if turn_complete else "",
-                "llm_response": turn_complete["payload"].get("llm_response", "") if turn_complete else "",
-                "tts_audio_b64": "",
-                "shot_latency_ms": turn_complete["payload"].get("shot_latency_ms", 0) if turn_complete else 0,
-                "segments": turn_complete["payload"].get("segments", []) if turn_complete else [],
+                "stt_text": payload.get("stt_text", ""),
+                "llm_response": payload.get("llm_response", ""),
+                "tts_audio_b64": base64.b64encode(payload.get("tts_audio", b"")).decode("ascii") if payload.get("tts_audio") else "",
+                "shot_latency_ms": payload.get("shot_latency_ms", 0),
+                "segments": payload.get("segments", []),
             }
         else:
             results = []
