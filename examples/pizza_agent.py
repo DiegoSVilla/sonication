@@ -123,7 +123,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     await ws.send_json({
         "type": "system",
-        "message": "Welcome to Marco's Pizza! Please speak or type your order.",
+        "message": "Welcome to Marco's Pizza! Hold Enter to speak, release to send.",
     })
 
     try:
@@ -160,67 +160,195 @@ async def websocket_endpoint(ws: WebSocket):
 async def index():
     """Simple HTML page for testing the WebSocket connection."""
     return HTMLResponse(
-        content="""
-<!DOCTYPE html>
+        content="""<!DOCTYPE html>
 <html>
 <head>
-    <title>Pizza Agent Demo</title>
+    <title>Pizza Agent</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
-        .message { padding: 10px; margin: 5px 0; border-radius: 8px; }
-        .user { background: #e3f2fd; text-align: right; }
-        .system { background: #f3e5f5; text-align: center; }
-        .response { background: #e8f5e9; }
-        .error { background: #ffebee; color: #c62828; }
-        input { width: 70%; padding: 10px; }
-        button { padding: 10px 20px; cursor: pointer; }
-        #output { max-height: 400px; overflow-y: auto; margin: 20px 0; }
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #fafafa; }
+        h1 { text-align: center; margin-bottom: 5px; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 20px; }
+        #output { max-height: 50vh; overflow-y: auto; margin-bottom: 20px; }
+        .message { padding: 10px 14px; margin: 6px 0; border-radius: 12px; line-height: 1.4; }
+        .user { background: #dbeafe; margin-left: 30%; }
+        .agent { background: #dcfce7; margin-right: 30%; }
+        .system { background: #f3e8ff; text-align: center; font-size: 0.85em; }
+        .error { background: #fee2e2; color: #991b1b; }
+        .latency { font-size: 0.75em; color: #999; margin-top: 2px; }
+        #controls { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+        #mic-btn {
+            width: 80px; height: 80px; border-radius: 50%; border: none;
+            background: #e5e7eb; cursor: pointer; font-size: 28px;
+            transition: all 0.15s; outline: none; user-select: none;
+            display: flex; align-items: center; justify-content: center;
+        }
+        #mic-btn.recording { background: #ef4444; transform: scale(1.1); }
+        #mic-btn:active { transform: scale(0.95); }
+        .hint { color: #666; font-size: 0.85em; }
+        #status { font-size: 0.8em; color: #999; height: 18px; }
+        button.stats { padding: 6px 16px; border: 1px solid #ccc; background: white; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
     </style>
 </head>
 <body>
-    <h1>Marco's Pizza Agent</h1>
-    <p>Connect via WebSocket and type your pizza order!</p>
+    <h1>Marco's Pizza</h1>
+    <p class="subtitle">Hold the mic button to speak, release to send</p>
     <div id="output"></div>
-    <input id="input" placeholder="Type your message..." />
-    <button onclick="send()">Send</button>
-    <button onclick="getStats()">Stats</button>
+    <div id="controls">
+        <div id="status"></div>
+        <button id="mic-btn" onmousedown="startRecord()" onmouseup="stopRecord()" ontouchstart="startRecord()" ontouchend="stopRecord()">🎤</button>
+        <p class="hint">Hold to record • Release to send</p>
+        <button class="stats" onclick="getStats()">Stats</button>
+    </div>
 
     <script>
         let ws = new WebSocket('ws://localhost:8000/ws');
         const output = document.getElementById('output');
-        const input = document.getElementById('input');
+        const micBtn = document.getElementById('mic-btn');
+        const status = document.getElementById('status');
+        let mediaRecorder, chunks = [];
+        let isRecording = false;
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
+            if (data.type === 'system') {
+                addMessage(data.message, 'system');
+            } else if (data.type === 'response') {
+                addMessage(data.stt_text || '(audio)', 'user');
+                addMessage(data.llm_response, 'agent');
+                if (data.shot_latency_ms) {
+                    const lat = document.createElement('div');
+                    lat.className = 'latency';
+                    lat.textContent = data.shot_latency_ms + 'ms latency';
+                    output.appendChild(lat);
+                }
+                speak(data.llm_response);
+            } else if (data.type === 'stats') {
+                addMessage('Turns: ' + data.turn_count + ' | Nodes: ' + data.nodes.join(', '), 'system');
+            } else if (data.type === 'error') {
+                addMessage(data.message, 'error');
+            }
+        };
+
+        function addMessage(text, cls) {
             const div = document.createElement('div');
-            div.className = 'message ' + data.type;
-            div.textContent = JSON.stringify(data, null, 2);
+            div.className = 'message ' + cls;
+            div.textContent = text;
             output.appendChild(div);
             output.scrollTop = output.scrollHeight;
-        };
+        }
 
-        ws.onerror = (err) => {
-            console.error('WebSocket error', err);
-        };
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+                const u = new SpeechSynthesisUtterance(text);
+                u.rate = 1.0;
+                u.pitch = 1.0;
+                window.speechSynthesis.speak(u);
+            }
+        }
 
-        function send() {
-            const msg = input.value.trim();
-            if (!msg) return;
-            ws.send(JSON.stringify({ type: 'text', content: msg }));
-            input.value = '';
+        async function startRecord() {
+            if (isRecording) return;
+            micBtn.classList.add('recording');
+            status.textContent = 'Recording...';
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                chunks = [];
+                mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+                mediaRecorder.onstop = () => sendAudio(stream);
+                mediaRecorder.start(100);
+            } catch (err) {
+                status.textContent = 'Mic error: ' + err.message;
+                micBtn.classList.remove('recording');
+            }
+            isRecording = true;
+        }
+
+        function stopRecord() {
+            if (!isRecording) return;
+            isRecording = false;
+            micBtn.classList.remove('recording');
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+        }
+
+        async function sendAudio(stream) {
+            status.textContent = 'Processing...';
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            try {
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                const decoded = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+                const wav = audioBufferToWav(decoded);
+                ws.send(JSON.stringify({ type: 'audio', content: arrayBufferToBase64(wav) }));
+                await audioCtx.close();
+            } catch (err) {
+                status.textContent = 'Audio error: ' + err.message;
+                return;
+            }
+            status.textContent = 'Listening...';
+            stream.getTracks().forEach(t => t.stop());
+        }
+
+        function audioBufferToWav(buffer) {
+            const numChannels = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+            const format = 1;
+            const bitDepth = 16;
+            const bytesPerSample = bitDepth / 8;
+            const blockAlign = numChannels * bytesPerSample;
+            const data = [];
+            for (let c = 0; c < numChannels; c++) data.push(buffer.getChannelData(c));
+            const outputLength = 44 + data[0].length * blockAlign;
+            const output = new Uint8Array(outputLength);
+            const view = new DataView(output);
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, outputLength - 8, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, format, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * blockAlign, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitDepth, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, data[0].length * blockAlign, true);
+            let offset = 44;
+            for (let i = 0; i < data[0].length; i++) {
+                for (let c = 0; c < numChannels; c++) {
+                    const sample = Math.max(-1, Math.min(1, data[c][i]));
+                    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+                    offset += 2;
+                }
+            }
+            return output;
+        }
+
+        function writeString(view, offset, str) {
+            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        }
+
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            const chunkSize = 8192;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+            }
+            return btoa(binary);
         }
 
         function getStats() {
             ws.send(JSON.stringify({ type: 'stats' }));
         }
-
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') send();
-        });
     </script>
 </body>
-</html>
-        """
+</html>"""
     )
 
 
