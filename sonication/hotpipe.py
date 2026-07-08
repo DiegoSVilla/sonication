@@ -44,6 +44,634 @@ def _phrase_ready(text: str) -> bool:
     return False
 
 
+class PhaseGate:
+    """Inter-stage phrase accumulator for LLM → TTS_CHUNK_IN_STREAM_OUT connections.
+    
+    Collects LLM tokens, buffers text, and emits complete phrases to a queue
+    as soon as they're ready (ASAP, not ALAP). This enables TTS to start
+    synthesizing while LLM is still streaming.
+    
+    Usage:
+        gate = PhaseGate(turn)
+        await gate.feed("Hello")       # LLM token 1
+        await gate.feed(", how are ")   # LLM token 2
+        await gate.feed("you?")         # LLM token 3 — phrase ready!
+        # Queue now contains: "Hello, how are you?"
+        await gate.close()              # LLM done — flush remaining buffer
+    """
+    
+    def __init__(self, turn: 'Turn', from_stage_id: str = ""):
+        self.turn = turn
+        self.from_stage_id = from_stage_id
+        self.buffer = ""
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.phrases_emitted = 0
+        self.total_chars = 0
+    
+    async def feed(self, token_text: str) -> None:
+        """Feed an LLM token to the phrase gate.
+        
+        If the accumulated text forms a complete phrase (≥PHRASE_MIN_CHARS
+        and ending with .!?), the phrase is extracted and put in the queue
+        for downstream TTS consumption.
+        
+        Args:
+            token_text: The content from an LLM token event
+        """
+        self.buffer += token_text
+        self.total_chars += len(token_text)
+        
+        if _phrase_ready(self.buffer):
+            # Extract phrase (everything up to and including the ending char)
+            phrase, self.buffer = self._extract_phrase()
+            await self.queue.put(phrase)
+            self.phrases_emitted += 1
+    
+    def _extract_phrase(self) -> Tuple[str, str]:
+        """Extract the first complete phrase from the buffer.
+        
+        Returns:
+            Tuple of (phrase, remaining_buffer)
+        """
+        # Find the first phrase-ending character after PHRASE_MIN_CHARS
+        for i in range(PHRASE_MIN_CHARS - 1, len(self.buffer)):
+            if self.buffer[i] in PHRASE_END_CHARS:
+                # Include the ending character
+                phrase = self.buffer[:i+1]
+                remaining = self.buffer[i+1:].lstrip()
+                return phrase, remaining
+        
+        # No complete phrase found — return empty phrase, keep buffer
+        return "", self.buffer
+    
+    async def close(self) -> None:
+        """Signal that LLM is done — flush remaining buffer as final phrase.
+        
+        Must be called when LLM stream completes to ensure any remaining
+        text is sent to TTS.
+        """
+        # Flush remaining buffer
+        if self.buffer.strip():
+            await self.queue.put(self.buffer.strip())
+        
+        # Put sentinel to signal TTS to stop
+        await self.queue.put(None)
+    
+    def get_stats(self) -> dict:
+        """Return phrase gate statistics."""
+        return {
+            "phrases_emitted": self.phrases_emitted,
+            "total_chars": self.total_chars,
+            "buffer_remaining": len(self.buffer),
+        }
+
+
+class EventStream:
+    """Central event stream for all pipeline nodes.
+    
+    All nodes push events to this shared queue as they happen.
+    The main scheduler pulls from the queue and yields events in order.
+    This ensures events are naturally ordered by when they occur,
+    with no post-hoc sorting or merging needed.
+    
+    Usage:
+        stream = EventStream()
+        # In node task:
+        await stream.put(event_dict)
+        # In main loop:
+        async for event in stream:
+            yield event
+    """
+    
+    def __init__(self):
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+    
+    async def put(self, event: dict) -> None:
+        """Push an event to the stream."""
+        if not self._closed:
+            await self._queue.put(event)
+    
+    async def __aiter__(self):
+        """Iterate over events from the stream."""
+        while True:
+            try:
+                event = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                yield event
+            except asyncio.TimeoutError:
+                if self._closed and self._queue.empty():
+                    break
+                continue
+    
+    def close(self) -> None:
+        """Signal that no more events will be pushed."""
+        self._closed = True
+
+
+class PipelineScheduler:
+    """Concurrent execution engine for pipeline nodes.
+    
+    Manages asyncio tasks for each node, event queues for inter-node
+    communication, and coordinates parallel execution based on topology
+    and node streaming types.
+    
+    All events flow through a central EventStream, ensuring natural
+    ordering by timestamp without post-hoc sorting.
+    
+    Execution model:
+        - Non-streaming nodes (STT, TTS_NON_STREAMING): run sequentially
+          — upstream completes before downstream starts
+        - Streaming nodes (LLM, TTS_CHUNK_IN_STREAM_OUT): run in parallel
+          — downstream starts as soon as upstream has enough data
+        
+    Usage:
+        scheduler = PipelineScheduler(turn, pipe)
+        async for event in scheduler.run():
+            yield event
+    """
+    
+    def __init__(self, turn: 'Turn', pipe: 'HotPipe', data):
+        self.turn = turn
+        self.pipe = pipe
+        self.data = data
+        self.event_stream = EventStream()
+        self.node_tasks: Dict[str, asyncio.Task] = {}
+        self.phase_gates: Dict[str, PhaseGate] = {}
+        self._completed = set()
+    
+    def _get_node_type(self, node_name: str) -> str:
+        """Get the streaming type for a node."""
+        node, category = self.pipe.nodes[node_name]
+        config_label = node.config_label if hasattr(node, 'config_label') else category
+        return config_label
+    
+    def _is_parallel_downstream(self, source_node: str, target_node: str) -> bool:
+        """Check if connection should run in parallel.
+        
+        Parallel when:
+            - Source is LLM_STREAMING and target is TTS_CHUNK_IN_STREAM_OUT
+            - This enables phrase-gated streaming
+        """
+        source_type = self._get_node_type(source_node)
+        target_type = self._get_node_type(target_node)
+        
+        # LLM → TTS_CHUNK_IN_STREAM_OUT is parallel (phrase-gated)
+        if source_type in (NodeConfigLabel.LLM_STREAMING, 
+                          NodeConfigLabel.LLM_STREAMING_WITH_REASONING):
+            if target_type == NodeConfigLabel.TTS_CHUNK_IN_STREAM_OUT:
+                return True
+        
+        return False
+    
+    async def _run_node(self, node_name: str, data, phase_gate: Optional[PhaseGate] = None):
+        """Run a single node, pushing events to the shared event stream.
+        
+        Args:
+            node_name: Name of the node to run
+            data: Input data for the node
+            phase_gate: Optional PhaseGate for LLM → TTS streaming
+        """
+        node, category = self.pipe.nodes[node_name]
+        config_label = node.config_label if hasattr(node, 'config_label') else category
+        
+        stage_id = self.pipe._generate_stage_id(node, node_name)
+        node._stage_id = stage_id
+        
+        stage_record = NodeStageRecord(
+            stage_id=stage_id,
+            node_name=node_name,
+            node_class=node.node_class,
+            config_label=config_label,
+            start_wall_ms=time.time() * 1000,
+            end_wall_ms=None,
+            timing={},
+            events=[],
+            payload_kind="unknown",
+        )
+        self.turn.record_node_stage(stage_record)
+        
+        # Push node_start to event stream
+        seq = self.turn._next_seq()
+        start_event = self.turn._make_event_dict(
+            f"{node_name}_start", node_name, self.turn.turn_id,
+            local_offset_ms=self.turn._now(),
+            payload={"category": category, "config_label": config_label},
+            stage_id=stage_id, seq=seq
+        )
+        await self.event_stream.put(start_event)
+        
+        node_start_wc = time.time() * 1000
+        llm_text_buffer = ""
+        tts_audio_chunks = []
+        last_event_type = None
+        last_event_data = None
+        
+        try:
+            async for raw in node.stream(data):
+                kind = raw.get("kind", "unknown")
+                
+                # Determine event type
+                etype = self._get_event_type(node_name, kind)
+                
+                # Log to DB
+                await self.turn._log_event(raw, node_name, None, 
+                                          stage_id=stage_id, seq=seq)
+                self.turn._event_seq += 1
+                last_event_type = kind
+                last_event_data = raw
+                
+                # Record phase boundaries
+                self.turn._record_phase_boundary(stage_record, raw, node_name, config_label)
+                
+                # Accumulate LLM text
+                if "content" in raw and node_name == "llm":
+                    llm_text_buffer += raw.get("content", "")
+                
+                # Capture TTS audio chunks
+                if node_name == "tts" and kind == "audio":
+                    pcm_data = raw.get("pcm", b"")
+                    if pcm_data:
+                        tts_audio_chunks.append(pcm_data)
+                
+                # Capture STT transcript
+                if node_name == "stt" and kind == "transcript":
+                    self.turn.stt_text = raw.get("text", "")
+                
+                # Create event dict
+                event = self.turn._make_event_dict(
+                    etype, node_name, self.turn.turn_id,
+                    local_offset_ms=self.turn._now(),
+                    payload=raw,
+                    stage_id=stage_id, seq=self.turn._event_seq
+                )
+                await self.event_stream.put(event)
+                
+                # Feed to phase gate if LLM
+                if node_name == "llm" and kind in ("token", "reasoning") and phase_gate:
+                    await phase_gate.feed(raw.get("content", ""))
+            
+            # After stream completes
+            self.turn._record_end_boundary(stage_record, node_name, node_start_wc)
+            
+            # Push node_done to event stream
+            done_event = self.turn._make_event_dict(
+                f"{node_name}_done", node_name, self.turn.turn_id,
+                local_offset_ms=self.turn._now(),
+                payload={},
+                stage_id=stage_id, seq=self.turn._event_seq
+            )
+            await self.event_stream.put(done_event)
+            
+            # Store accumulated results
+            if node_name == "llm":
+                self.turn.llm_text = llm_text_buffer
+                stt_input = self.turn.stt_text
+                if hasattr(node, 'complete_turn') and stt_input:
+                    node.complete_turn(stt_input, llm_text_buffer)
+            
+            if node_name == "tts" and tts_audio_chunks:
+                self.turn.tts_audio = b"".join(tts_audio_chunks)
+            
+            # Enqueue node_stage to log_manager
+            stage_record.end_wall_ms = time.time() * 1000
+            self.turn.record_node_stage(stage_record)
+            if self.turn._log_manager:
+                logger.info(f"Enqueueing node_stage: {stage_record.node_name} turn_id={self.turn.turn_id}")
+                self.turn._log_manager.enqueue({
+                    "_log_kind": "node_stage",
+                    "stage_id": stage_record.stage_id,
+                    "turn_id": self.turn.turn_id,
+                    "session_id": None,
+                    "conversation_id": None,
+                    "node_name": stage_record.node_name,
+                    "node_class": stage_record.node_class,
+                    "config_label": stage_record.config_label,
+                    "start_wall_ms": stage_record.start_wall_ms,
+                    "end_wall_ms": stage_record.end_wall_ms,
+                    "timing": stage_record.timing,
+                    "summary": {},
+                })
+        
+        except Exception as e:
+            error_event = self.turn._make_event_dict(
+                f"{node_name}_error", node_name, self.turn.turn_id,
+                payload={"error": str(e)}
+            )
+            await self.event_stream.put(error_event)
+            raise
+        finally:
+            if not stage_record.end_wall_ms:
+                stage_record.end_wall_ms = time.time() * 1000
+                self.turn.record_node_stage(stage_record)
+    
+    def _get_event_type(self, node_name: str, kind: str) -> str:
+        """Map node + kind to event type string."""
+        if node_name == "stt":
+            return {"transcript": "stt_transcript", "error": f"stt_{kind}",
+                    "done": "stt_done"}.get(kind, f"stt_{kind}")
+        elif node_name == "llm":
+            return {"token": "llm_token", "reasoning": "llm_reasoning",
+                    "error": f"llm_{kind}", "done": "llm_done",
+                    "usage": "llm_usage"}.get(kind, f"llm_{kind}")
+        elif node_name == "tts":
+            return {"audio": "tts_audio_chunk", "usage": "tts_usage",
+                    "error": f"tts_{kind}", "done": "tts_done"}.get(kind,
+                    f"tts_{kind}")
+        else:
+            return f"{node_name}_{kind}"
+    
+    async def run_parallel(self):
+        """Execute pipeline with concurrent node execution.
+        
+        All events flow through a central EventStream, ensuring natural
+        ordering by timestamp without post-hoc sorting.
+        """
+        entry_point = self.turn._detect_entry_point(self.pipe)
+        
+        # Push turn_start to event stream
+        await self.event_stream.put(self.turn._make_event_dict(
+            "turn_start", entry_point, self.turn.turn_id,
+            local_offset_ms=0.0,
+            payload={"pipeline_type": self.turn._pipeline_type, 
+                    "entry_node": entry_point},
+            stage_id="", seq=0
+        ))
+        
+        try:
+            # 1. Run entry node (STT) to get transcript
+            await self._run_node(entry_point, self.data)
+            
+            # Capture STT transcript from turn state
+            stt_transcript = self.turn.stt_text
+            
+            # 2. Determine downstream nodes and their execution mode
+            downstream = self.pipe.connections.get(entry_point, [])
+            
+            if not downstream:
+                # Single-node pipeline, we're done
+                pass
+            elif len(downstream) == 1:
+                next_node = downstream[0]
+                
+                # Check if this is a multi-step pipeline with parallel downstream
+                # e.g., STT→LLM→TTS where LLM→TTS is parallel
+                next_downstream = self.pipe.connections.get(next_node, [])
+                is_llm_to_tts_parallel = (
+                    next_downstream and
+                    self._is_parallel_downstream(next_node, next_downstream[0])
+                )
+                
+                if is_llm_to_tts_parallel:
+                    # Multi-step: entry → LLM → TTS (parallel)
+                    # Run LLM and TTS in parallel with phase gate
+                    await self._run_parallel_with_phase_gate(
+                        next_node, next_downstream[0],
+                        llm_data=stt_transcript
+                    )
+                else:
+                    # Simple sequential: entry → next_node
+                    next_data = stt_transcript if entry_point == 'stt' else self.data
+                    await self._run_sequential(entry_point, next_node, next_data)
+            else:
+                # Multiple downstream — run all in parallel
+                tasks = []
+                for next_node in downstream:
+                    tasks.append(asyncio.create_task(
+                        self._run_node(next_node, None)
+                    ))
+                
+                await asyncio.gather(*tasks)
+        
+        except Exception as e:
+            error_event = self.turn._make_event_dict(
+                "turn_error", entry_point, self.turn.turn_id,
+                payload={"error": str(e)}
+            )
+            await self.event_stream.put(error_event)
+            raise
+        
+        # Build segments for turn_complete
+        segments = []
+        try:
+            analysis = self.turn.analyse()
+            segments = [
+                {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
+                for s in analysis.segments
+            ]
+        except Exception:
+            pass
+        
+        # Push turn_complete to event stream
+        await self.event_stream.put(self.turn._make_event_dict(
+            "turn_complete", entry_point, self.turn.turn_id,
+            payload={
+                "stt_text": self.turn.stt_text,
+                "llm_response": self.turn.llm_text,
+                "tts_audio": self.turn.tts_audio,
+                "shot_latency_ms": self.turn.shot_latency_ms(),
+                "stt_ms": self.turn.stt_done_ms - self.turn.stt_start_ms,
+                "llm_ttft_ms": self.turn.llm_ttft_ms,
+                "tts_ttfb_ms": self.turn.tts_ttfb_ms,
+                "segments": segments,
+            }
+        ))
+        
+        # Close the event stream and yield all events
+        self.event_stream.close()
+        async for event in self.event_stream:
+            yield event
+    
+    async def _run_parallel_with_phase_gate(self, upstream_node: str, downstream_node: str, llm_data=None):
+        """Run upstream → downstream with phrase-gated parallel execution.
+        
+        Upstream (LLM) streams tokens → PhaseGate accumulates → emits phrases
+        Downstream (TTS) reads phrases from queue → synthesizes audio
+        
+        Both run concurrently, pushing events to the shared event_stream.
+        
+        Args:
+            upstream_node: LLM node name
+            downstream_node: TTS node name
+            llm_data: Input data for LLM (STT transcript)
+        """
+        # Create phase gate
+        phase_gate = PhaseGate(self.turn)
+        self.phase_gates[downstream_node] = phase_gate
+        
+        # Start LLM task with STT transcript
+        llm_task = asyncio.create_task(
+            self._run_node(upstream_node, llm_data, phase_gate)
+        )
+        
+        # Start TTS task (fed by phase gate)
+        tts_task = asyncio.create_task(
+            self._run_tts_from_phase_gate(downstream_node, phase_gate)
+        )
+        
+        # Wait for LLM to complete
+        await llm_task
+        
+        # Close phase gate to signal TTS to finish
+        await phase_gate.close()
+        
+        # Wait for TTS to complete
+        await tts_task
+    
+    async def _run_tts_from_phase_gate(self, tts_node: str, phase_gate: PhaseGate):
+        """Run TTS node, consuming phrases from phase gate queue.
+        
+        Each phrase triggers a TTS synthesis call. When phase_gate is
+        closed (LLM done + buffer flushed), TTS completes.
+        
+        All events are pushed to the shared event_stream.
+        """
+        node, category = self.pipe.nodes[tts_node]
+        config_label = node.config_label if hasattr(node, 'config_label') else category
+        
+        stage_id = self.pipe._generate_stage_id(node, tts_node)
+        node._stage_id = stage_id
+        
+        tts_audio_chunks = []
+        
+        stage_record = NodeStageRecord(
+            stage_id=stage_id,
+            node_name=tts_node,
+            node_class=node.node_class,
+            config_label=config_label,
+            start_wall_ms=time.time() * 1000,
+            end_wall_ms=None,
+            timing={},
+            events=[],
+            payload_kind="unknown",
+        )
+        self.turn.record_node_stage(stage_record)
+        
+        # Create node_start event
+        seq = self.turn._next_seq()
+        start_event = self.turn._make_event_dict(
+            f"{tts_node}_start", tts_node, self.turn.turn_id,
+            local_offset_ms=self.turn._now(),
+            payload={"category": category, "config_label": config_label},
+            stage_id=stage_id, seq=seq
+        )
+        await self.event_stream.put(start_event)
+        
+        tts_start_wc = time.time() * 1000
+        phrase_num = 0
+        
+        try:
+            while True:
+                phrase = await phase_gate.queue.get()
+                if phrase is None:  # sentinel
+                    break
+                
+                # Skip empty or whitespace-only phrases
+                if not phrase.strip():
+                    continue
+                
+                phrase_num += 1
+                phrase_stage_id = f"{stage_id}_phrase_{phrase_num}"
+                
+                # Log phrase gate event BEFORE TTS synthesis
+                gate_event = self.turn._make_event_dict(
+                    "phrase_gate", "llm", self.turn.turn_id,
+                    local_offset_ms=self.turn._now(),
+                    payload={
+                        "accumulated_text": phrase,
+                        "from_stage_id": self.phase_gates.get(tts_node, PhaseGate(self.turn)).from_stage_id if tts_node in self.phase_gates else "",
+                        "phrase_number": phrase_num,
+                    },
+                    stage_id=stage_id, seq=self.turn._event_seq
+                )
+                await self.event_stream.put(gate_event)
+                
+                # Synthesize this phrase
+                async for raw in node.stream(phrase):
+                    kind = raw.get("kind", "unknown")
+                    etype = self._get_event_type(tts_node, kind)
+                    
+                    # Record phase boundaries
+                    self.turn._record_phase_boundary(stage_record, raw, tts_node, config_label)
+                    
+                    # Capture TTS audio chunks
+                    if kind == "audio":
+                        pcm_data = raw.get("pcm", b"")
+                        if pcm_data:
+                            tts_audio_chunks.append(pcm_data)
+                    
+                    event = self.turn._make_event_dict(
+                        etype, tts_node, self.turn.turn_id,
+                        local_offset_ms=self.turn._now(),
+                        payload=raw,
+                        stage_id=phrase_stage_id, seq=self.turn._event_seq
+                    )
+                    await self.event_stream.put(event)
+        
+        except Exception as e:
+            error_event = self.turn._make_event_dict(
+                f"{tts_node}_error", tts_node, self.turn.turn_id,
+                payload={"error": str(e)}
+            )
+            await self.event_stream.put(error_event)
+            raise
+        finally:
+            # Record end boundary
+            self.turn._record_end_boundary(stage_record, tts_node, tts_start_wc)
+            
+            # Create node_done event
+            done_event = self.turn._make_event_dict(
+                f"{tts_node}_done", tts_node, self.turn.turn_id,
+                local_offset_ms=self.turn._now(),
+                payload={},
+                stage_id=stage_id, seq=self.turn._event_seq
+            )
+            await self.event_stream.put(done_event)
+            
+            # Store accumulated audio
+            if tts_audio_chunks:
+                self.turn.tts_audio = b"".join(tts_audio_chunks)
+            
+            # Update stage record
+            stage_record.end_wall_ms = time.time() * 1000
+            self.turn.record_node_stage(stage_record)
+            
+            if self.turn._log_manager:
+                logger.info(f"Enqueueing node_stage: {stage_record.node_name} turn_id={self.turn.turn_id}")
+                self.turn._log_manager.enqueue({
+                    "_log_kind": "node_stage",
+                    "stage_id": stage_record.stage_id,
+                    "turn_id": self.turn.turn_id,
+                    "session_id": None,
+                    "conversation_id": None,
+                    "node_name": stage_record.node_name,
+                    "node_class": stage_record.node_class,
+                    "config_label": stage_record.config_label,
+                    "start_wall_ms": stage_record.start_wall_ms,
+                    "end_wall_ms": stage_record.end_wall_ms,
+                    "timing": stage_record.timing,
+                    "summary": {},
+                })
+    
+    async def _run_sequential(self, upstream_node: str, downstream_node: str, upstream_data=None):
+        """Run upstream → downstream sequentially.
+        
+        Upstream completes completely before downstream starts.
+        Used for non-streaming connections.
+        
+        Args:
+            upstream_node: First node to run
+            downstream_node: Second node to run
+            upstream_data: Input data for upstream node
+        """
+        # Run upstream node
+        await self._run_node(upstream_node, upstream_data)
+        
+        # Run downstream node
+        next_data = self.turn._next_data(upstream_node, None)
+        if next_data is not None:
+            await self._run_node(downstream_node, next_data)
+
+
 class PingLoop:
     """Background keepalive ping loop.
 
@@ -210,6 +838,9 @@ class Turn:
     async def run_events(self, pipe, data):
         """Execute the pipeline and yield all events with timestamps in real-time.
         
+        Uses PipelineScheduler for concurrent node execution when topology
+        supports it (e.g., LLM → TTS_CHUNK_IN_STREAM_OUT with phrase gate).
+        
         Yields event dicts with:
             - type: event type (turn_start, node_start, stt_transcript, llm_token, etc.)
             - turn_id: unique turn identifier
@@ -224,52 +855,11 @@ class Turn:
             - stt_text, llm_response, tts_audio, shot_latency_ms, segments
         """
         self._log_manager = pipe._log_manager
-        entry_point = self._detect_entry_point(pipe)
-        self._phrase_gate_emitted = False
         
-        # Yield turn_start
-        yield self._make_event_dict(
-            "turn_start", entry_point, self.turn_id,
-            local_offset_ms=0.0,
-            payload={"pipeline_type": self._pipeline_type, "entry_node": entry_point},
-            stage_id="", seq=0
-        )
-        
-        try:
-            async for event in self._walk_events(pipe, entry_point, data):
-                yield event
-        except Exception as e:
-            yield self._make_event_dict(
-                "turn_error", entry_point, self.turn_id,
-                payload={"error": str(e)}
-            )
-            raise
-        
-        # Build segments for turn_complete
-        segments = []
-        try:
-            analysis = self.analyse()
-            segments = [
-                {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
-                for s in analysis.segments
-            ]
-        except Exception:
-            pass
-        
-        # Yield turn_complete with aggregated results
-        yield self._make_event_dict(
-            "turn_complete", entry_point, self.turn_id,
-            payload={
-                "stt_text": self.stt_text,
-                "llm_response": self.llm_text,
-                "tts_audio": self.tts_audio,
-                "shot_latency_ms": self.shot_latency_ms(),
-                "stt_ms": self.stt_done_ms - self.stt_start_ms,
-                "llm_ttft_ms": self.llm_ttft_ms,
-                "tts_ttfb_ms": self.tts_ttfb_ms,
-                "segments": segments,
-            }
-        )
+        # Use parallel scheduler for cascade execution
+        scheduler = PipelineScheduler(self, pipe, data)
+        async for event in scheduler.run_parallel():
+            yield event
 
     def _make_event_dict(self, event_type, node_name, turn_id, local_offset_ms=0.0,
                          payload=None, stage_id="", seq=0):
