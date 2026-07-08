@@ -158,6 +158,93 @@ class PizzaAgent:
                 "segments": segments,
             }
 
+    async def run_turn_stream(self, audio_bytes: bytes, session_id: str = "",
+                              send_fn=None):
+        """Process one turn and stream events through send_fn as they happen.
+        
+        Yields WebSocket message dicts in real-time:
+            - stt_done: STT transcript ready
+            - llm_token: LLM token received (streaming text)
+            - tts_audio: TTS audio chunk ready (base64 PCM)
+            - response: final turn result with latency + segments
+        
+        Args:
+            audio_bytes: Input audio bytes.
+            session_id: Session identifier.
+            send_fn: Async callable to send each message (e.g., ws.send_json).
+        """
+        self.turn_count += 1
+        logger.info(f"Processing turn {self.turn_count} [session={session_id}]...")
+        
+        turn_index = self.turn_count
+        llm_text = ""
+        tts_audio_chunks = []
+        segments = []
+        shot_latency = 0
+        stt_text = ""
+        
+        async for event in self.pipeline.turn("stt", audio_bytes, stream_events=True):
+            event_type = event.get("event_type")
+            emitter = event.get("emitter_node")
+            payload = event.get("payload", {})
+            
+            if event_type == "turn_complete":
+                # Extract final results from payload
+                stt_text = payload.get("stt_text", "")
+                llm_text = payload.get("llm_response", "")
+                tts_audio = payload.get("tts_audio", b"")
+                shot_latency = payload.get("shot_latency_ms", 0)
+                segments = payload.get("segments", [])
+                
+                # Send final response
+                final_msg = {
+                    "type": "response",
+                    "turn_index": turn_index,
+                    "stt_text": stt_text,
+                    "llm_response": llm_text,
+                    "tts_audio_b64": base64.b64encode(tts_audio).decode("ascii") if tts_audio else "",
+                    "shot_latency_ms": shot_latency,
+                    "segments": segments,
+                }
+                if send_fn:
+                    await send_fn(final_msg)
+                break
+            
+            # Stream intermediate events
+            if emitter == "stt" and event_type == "done":
+                # STT done — send transcript
+                msg = {
+                    "type": "stt_done",
+                    "turn_index": turn_index,
+                    "text": stt_text or payload.get("text", ""),
+                }
+                if send_fn:
+                    await send_fn(msg)
+            
+            elif emitter == "llm" and event_type == "token":
+                # LLM token — stream text progressively
+                token_text = payload.get("content", "")
+                if token_text:
+                    msg = {
+                        "type": "llm_token",
+                        "turn_index": turn_index,
+                        "content": token_text,
+                    }
+                    if send_fn:
+                        await send_fn(msg)
+            
+            elif emitter == "tts" and event_type == "chunk":
+                # TTS audio chunk — stream PCM
+                pcm_data = payload.get("pcm", b"")
+                if pcm_data:
+                    msg = {
+                        "type": "audio_out",
+                        "turn_index": turn_index,
+                        "pcm_b64": base64.b64encode(pcm_data).decode("ascii"),
+                    }
+                    if send_fn:
+                        await send_fn(msg)
+
     def get_stats(self) -> dict:
         """Return pipeline statistics."""
         return {
@@ -213,8 +300,10 @@ async def websocket_endpoint(ws: WebSocket):
                 audio_b64 = data.get("audio_b64", "")
                 audio_bytes = base64.b64decode(audio_b64)
                 try:
-                    result = await pizza_agent.run_turn(audio_bytes, session_id)
-                    await ws.send_json(result)
+                    # Set mic to processing state
+                    await ws.send_json({"type": "channel_playback_start"})
+                    # Stream turn events in real-time
+                    await pizza_agent.run_turn_stream(audio_bytes, session_id, send_fn=ws.send_json)
                 except Exception as e:
                     logger.error(f"Turn error: {e}", exc_info=True)
                     await ws.send_json({"type": "error", "message": str(e)})

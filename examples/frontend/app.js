@@ -13,6 +13,10 @@ let srcNode = null;
 let procNode = null;
 let recSamples = [];
 
+// Track last assistant bubble for streaming LLM text.
+let lastAssistantBubble = null;
+let currentTurnIndex = null;
+
 const $ = (id) => document.getElementById(id);
 const transcript = $("transcript");
 const shotTimes = [];
@@ -58,6 +62,19 @@ function bubble(role, text) {
   transcript.appendChild(el);
   transcript.scrollTop = transcript.scrollHeight;
   return el;
+}
+
+function bubbleAppend(role, text) {
+  // If this is a new turn, start a fresh assistant bubble
+  if (role !== "assistant" || !lastAssistantBubble || currentTurnIndex === null) {
+    lastAssistantBubble = bubble(role, text);
+    currentTurnIndex = null;
+    return lastAssistantBubble;
+  }
+  // Append to the existing assistant bubble for streaming
+  lastAssistantBubble.textContent += text;
+  transcript.scrollTop = transcript.scrollHeight;
+  return lastAssistantBubble;
 }
 
 function bubbleSystem(text) {
@@ -199,13 +216,23 @@ function handle(msg) {
     case "system":
       bubbleSystem(msg.message);
       break;
-    case "response":
-      bubble("user", msg.stt_text || "(no speech detected)");
-      bubble("assistant", msg.llm_response || "");
-      ttsPlayCursor = audioCtx ? audioCtx.currentTime : 0;
-      if (msg.tts_audio_b64) {
-        playTtsChunk({ pcm_b64: msg.tts_audio_b64, turn_index: msg.turn_index });
+    case "stt_done":
+      // STT transcript ready — show as user bubble
+      currentTurnIndex = msg.turn_index;
+      lastAssistantBubble = null;
+      bubble("user", msg.text || "(no speech detected)");
+      break;
+    case "llm_token":
+      // LLM token streaming — append to assistant bubble progressively
+      if (currentTurnIndex !== msg.turn_index) {
+        currentTurnIndex = msg.turn_index;
+        lastAssistantBubble = null;
       }
+      bubbleAppend("assistant", msg.content || "");
+      break;
+    case "response":
+      // Final turn result — show latency + waterfall
+      currentTurnIndex = msg.turn_index;
       if (msg.shot_latency_ms) {
         $("latency").textContent = msg.shot_latency_ms + "ms";
         shotTimes.push(msg.shot_latency_ms);
@@ -219,10 +246,11 @@ function handle(msg) {
       }
       break;
     case "audio_out":
+      ttsPlayCursor = audioCtx ? audioCtx.currentTime : 0;
       playTtsChunk(msg);
       break;
     case "channel_playback_start":
-      setMic("idle");
+      setMic("processing");
       break;
     case "error":
       bubble("assistant", `[error] ${msg.message}`);
