@@ -104,19 +104,6 @@ function stopRecordingAndSend() {
   const wav = encodeWav(resampled, targetRate);
   send({ type: "user_audio", audio_b64: abToB64(wav) });
 }
-  setMic("processing");
-
-  // Resample from AudioContext rate (48kHz) to 16kHz for STT
-  const targetRate = 16000;
-  const ratio = audioCtx.sampleRate / targetRate;
-  const resampled = new Float32Array(Math.floor(flat.length / ratio));
-  for (let i = 0; i < resampled.length; i++) {
-    resampled[i] = flat[Math.floor(i * ratio)];
-  }
-
-  const wav = encodeWav(resampled, targetRate);
-  send({ type: "user_audio", audio_b64: abToB64(wav) });
-}
 
 function encodeWav(samples, sampleRate) {
   const n = samples.length;
