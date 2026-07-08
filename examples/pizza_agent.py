@@ -72,8 +72,10 @@ class PizzaAgent:
         self.tts_node = sonication.TTSNode(tts_url, voice="ryan", language="English")
 
         # Create pipeline — context management is internal to LLMNode
+        self.log_manager = sonication.LogManager(db_path="data/calls.db")
         self.pipeline = sonication.HotPipe(
-            pipeline_type=sonication.PipelineType.SI_SO_THREE_STEP_PIPELINE_CHAT
+            pipeline_type=sonication.PipelineType.SI_SO_THREE_STEP_PIPELINE_CHAT,
+            log_manager=self.log_manager,
         )
         self.pipeline.add_node(self.stt_node)
         self.pipeline.add_node(self.llm_node)
