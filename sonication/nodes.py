@@ -111,33 +111,52 @@ class Node:
 
 
 class STTNode(Node):
-    """Speech-to-Text. Accepts PCM bytes, yields transcript."""
+    """Speech-to-Text. Accepts audio bytes, yields transcript.
+
+    Args:
+        base_url: STT endpoint URL.
+        api_key: Optional API key.
+        db: Optional database for logging.
+        sample_rate: Sample rate for PCM wrapping (ignored if input_format="wav").
+        input_format: Format of incoming audio bytes.
+            "wav" — WAV with header, pass through directly (browser default).
+            "pcm" — Raw 16-bit PCM, wrapped in WAV with sample_rate.
+            "flac" — FLAC bytes, passed through directly.
+            Defaults to "wav" to match browser encoder output.
+    """
 
     _config_label = NodeConfigLabel.STT_NON_STREAMING
 
-    def __init__(self, base_url: str, api_key: str = "", db=None, sample_rate: int = 16000):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        db=None,
+        sample_rate: int = 16000,
+        input_format: str = "wav",
+    ):
         super().__init__(base_url, api_key, db)
         self.sample_rate = sample_rate
+        self.input_format = input_format.lower()
 
     def route(self) -> str:
         return "/v1/audio/transcriptions"
 
     async def stream(self, audio_bytes: bytes, language: str = None) -> AsyncIterator[dict]:
-        """Transcribe audio. The frontend sends WAV (with header) at the browser's
-        native sample rate. We pass it through directly — the STT endpoint reads
-        the WAV header to determine sample rate."""
+        """Transcribe audio. Handles different input formats configured at init."""
         try:
-            # Detect if this is already WAV (starts with RIFF header)
-            is_wav = audio_bytes[:4] == b'RIFF'
-            
-            if is_wav:
+            fmt = self.input_format
+            lang = language or config.STT_LANGUAGE
+
+            if fmt == "wav":
                 # Already WAV — pass through directly (like minimalVoice)
-                logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes WAV")
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes WAV")
                 result = await clients.transcribe(audio_bytes, filename="audio.wav",
-                                                   language=language or config.STT_LANGUAGE)
-            else:
-                # Raw PCM — wrap in WAV with configured sample_rate
-                logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes PCM (raw)")
+                                                   content_type="audio/wav", language=lang)
+
+            elif fmt == "pcm":
+                # Raw 16-bit PCM — wrap in WAV with configured sample_rate
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes PCM → WAV")
                 wav_buf = io.BytesIO()
                 with wave.open(wav_buf, "wb") as wf:
                     wf.setnchannels(1)
@@ -145,12 +164,19 @@ class STTNode(Node):
                     wf.setframerate(self.sample_rate)
                     wf.writeframes(audio_bytes)
                 wav_bytes = wav_buf.getvalue()
-                logger.info(f"STTNode.stream: created {len(wav_bytes)} bytes WAV from PCM")
                 result = await clients.transcribe(wav_bytes, filename="audio.wav",
-                                                   language=language or config.STT_LANGUAGE)
-            
+                                                   content_type="audio/wav", language=lang)
+
+            elif fmt == "flac":
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes FLAC")
+                result = await clients.transcribe(audio_bytes, filename="audio.flac",
+                                                   content_type="audio/flac", language=lang)
+
+            else:
+                raise ValueError(f"STTNode: unsupported input_format='{fmt}'. Use 'wav', 'pcm', or 'flac'.")
+
             text = result.get("text", "")
-            logger.info(f"STT result: text='{text}', raw_keys={list(result.keys())}, raw={result}")
+            logger.info(f"STT result: text='{text}', raw={result}")
             yield {"kind": "transcript", "text": text, "usage": result.get("usage", {})}
             yield {"kind": "done", "text": text}
 

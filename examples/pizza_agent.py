@@ -61,7 +61,7 @@ class PizzaAgent:
         self.tts_url = tts_url
 
         # Create nodes
-        self.stt_node = sonication.STTNode(stt_url, sample_rate=16000)
+        self.stt_node = sonication.STTNode(stt_url, sample_rate=16000, input_format="wav")
         self.llm_node = sonication.LLMNode(
             llm_url,
             system_prompt=PIZZA_SYSTEM_PROMPT,
