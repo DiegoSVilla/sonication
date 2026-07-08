@@ -123,19 +123,32 @@ class STTNode(Node):
         return "/v1/audio/transcriptions"
 
     async def stream(self, audio_bytes: bytes, language: str = None) -> AsyncIterator[dict]:
-        """Transcribe PCM audio. Wraps raw PCM in WAV with configured sample_rate."""
+        """Transcribe audio. The frontend sends WAV (with header) at the browser's
+        native sample rate. We pass it through directly — the STT endpoint reads
+        the WAV header to determine sample rate."""
         try:
-            logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes PCM")
-            wav_buf = io.BytesIO()
-            with wave.open(wav_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self.sample_rate)
-                wf.writeframes(audio_bytes)
-            wav_bytes = wav_buf.getvalue()
-            logger.info(f"STTNode.stream: created {len(wav_bytes)} bytes WAV")
-
-            result = await clients.transcribe(wav_bytes, filename="audio.wav", language=language or config.STT_LANGUAGE)
+            # Detect if this is already WAV (starts with RIFF header)
+            is_wav = audio_bytes[:4] == b'RIFF'
+            
+            if is_wav:
+                # Already WAV — pass through directly (like minimalVoice)
+                logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes WAV")
+                result = await clients.transcribe(audio_bytes, filename="audio.wav",
+                                                   language=language or config.STT_LANGUAGE)
+            else:
+                # Raw PCM — wrap in WAV with configured sample_rate
+                logger.info(f"STTNode.stream: received {len(audio_bytes)} bytes PCM (raw)")
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes(audio_bytes)
+                wav_bytes = wav_buf.getvalue()
+                logger.info(f"STTNode.stream: created {len(wav_bytes)} bytes WAV from PCM")
+                result = await clients.transcribe(wav_bytes, filename="audio.wav",
+                                                   language=language or config.STT_LANGUAGE)
+            
             text = result.get("text", "")
             logger.info(f"STT result: text='{text}', raw_keys={list(result.keys())}, raw={result}")
             yield {"kind": "transcript", "text": text, "usage": result.get("usage", {})}

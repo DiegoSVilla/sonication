@@ -104,23 +104,27 @@ function stopRecordingAndSend() {
     return;
   }
   setMic("processing");
+  const wav = encodeWav(flat, audioCtx.sampleRate);
+  send({ type: "user_audio", audio_b64: abToB64(wav) });
+}
 
-  // Resample from AudioContext rate (48kHz) to 16kHz (STT default)
-  const targetRate = 16000;
-  const ratio = audioCtx.sampleRate / targetRate;
-  const resampled = new Float32Array(Math.floor(flat.length / ratio));
-  for (let i = 0; i < resampled.length; i++) {
-    resampled[i] = flat[Math.floor(i * ratio)];
+function encodeWav(samples, sampleRate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const dv = new DataView(buf);
+  const ws = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  ws(36, "data"); dv.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    dv.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    off += 2;
   }
-
-  // Convert Float32 to raw 16-bit PCM (no WAV header — STTNode wraps it)
-  const pcm = new ArrayBuffer(resampled.length * 2);
-  const view = new DataView(pcm);
-  for (let i = 0; i < resampled.length; i++) {
-    const s = Math.max(-1, Math.min(1, resampled[i]));
-    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-  send({ type: "user_audio", audio_b64: abToB64(pcm) });
+  return buf;
 }
 
 function abToB64(ab) {
