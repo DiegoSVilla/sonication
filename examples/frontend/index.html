@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Marco's Pizza</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #0d1117; color: #e6edf3; display: flex; height: 100vh;
+    }
+    #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    header {
+      padding: 10px 16px; border-bottom: 1px solid #21262d;
+      display: flex; align-items: center; gap: 16px; font-size: 13px;
+    }
+    header .dot { width: 9px; height: 9px; border-radius: 50%; background: #f85149; }
+    header .dot.on { background: #3fb950; }
+    #transcript { flex: 1; overflow-y: auto; padding: 16px; }
+    .msg { margin: 8px 0; max-width: 80%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
+    .msg.user { background: #1f6feb; margin-left: auto; }
+    .msg.assistant { background: #21262d; }
+    #ptt { display: flex; align-items: center; gap: 14px; padding: 16px; border-top: 1px solid #21262d; }
+    #micdot { width: 16px; height: 16px; border-radius: 50%; background: #30363d; transition: background .1s, box-shadow .1s; flex: none; }
+    #ptt.recording #micdot { background: #f85149; box-shadow: 0 0 0 6px rgba(248,81,73,.2); }
+    #ptt.processing #micdot { background: #d29922; }
+    #pttlabel { font-size: 14px; color: #e6edf3; }
+    #pttlabel small { display: block; color: #7d8590; font-size: 12px; margin-top: 2px; }
+    kbd { background: #21262d; border: 1px solid #30363d; border-bottom-width: 2px; border-radius: 5px; padding: 1px 7px; font-family: ui-monospace, monospace; font-size: 12px; }
+    aside { width: 300px; border-left: 1px solid #21262d; padding: 16px; overflow-y: auto; font-size: 13px; }
+    aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #7d8590; margin: 18px 0 8px; }
+    .metric { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #161b22; }
+    .metric b { font-family: ui-monospace, monospace; color: #58a6ff; }
+    .wf { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; font-family: ui-monospace, monospace; }
+    .wf .bar { height: 8px; border-radius: 2px; flex: none; }
+    .wf .lbl { flex: 1; color: #c9d1d9; }
+    .wf .val { color: #58a6ff; }
+    .wf.service .bar { background: #1f6feb; }
+    .wf.pipeline .bar { background: #8957e5; }
+    .wf.transport .bar { background: #6e7681; }
+    .wf.total { border-top: 1px solid #21262d; margin-top: 4px; padding-top: 6px; color: #e6ed3; }
+  </style>
+</head>
+<body>
+  <div id="main">
+    <header>
+      <span class="dot" id="dot"></span>
+      <b>Marco's Pizza</b>
+      <span style="margin-left:auto; display:flex; gap:14px; align-items:center;">
+        <span id="latency" style="color:#7d8590;font-family:ui-monospace;font-size:12px">-</span>
+      </span>
+    </header>
+    <div id="transcript"></div>
+    <div id="ptt">
+      <span id="micdot"></span>
+      <span id="pttlabel">Hold <kbd>Enter</kbd> to talk
+        <small>Release to send. The shot clock runs from release to first audio.</small>
+      </span>
+    </div>
+  </div>
+  <aside>
+    <h2>Shot latency (release→first audio)</h2>
+    <div class="metric"><span>Last shot</span><b id="m_shot">-</b></div>
+    <div class="metric"><span>Avg shot <small id="m_shot_n" style="color:#7d8590"></small></span><b id="m_shot_avg">-</b></div>
+    <h2>Stage breakdown</h2>
+    <div id="waterfall"><span style="color:#7d8590;font-size:12px">talk to see the breakdown</span></div>
+  </aside>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -619,6 +619,7 @@ class HotPipe:
         self._node_data = {}  # name -> list of raw events
         self._nodes_health = {}  # name -> [rtt_ms ...]
         self._ping_loop = None
+        self._last_turn = None  # last Turn object for analysis access
         self._stage_counter: Dict[str, int] = {}  # config_label -> count
 
     def add_node(self, node: Any) -> None:
@@ -774,7 +775,9 @@ class HotPipe:
         turn = Turn(turn_id, start_wall, start_wall,
                     pipeline_type=self.pipeline_type.value if self.pipeline_type else pipeline_type)
         try:
-            return await turn.run(self, data)
+            result = await turn.run(self, data)
+            self._last_turn = turn
+            return result
         except Exception as e:
             logger.error(f"Turn {turn_id} failed: {e}")
             raise

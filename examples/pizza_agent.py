@@ -8,19 +8,25 @@ Usage:
     python examples/pizza_agent.py
 
 The server will start on http://localhost:8000
-Connect via WebSocket at ws://localhost:8000/ws
+Open in a browser and hold Enter to talk.
 """
 import asyncio
 import base64
+import io
 import logging
+import wave
+from pathlib import Path
 from typing import Optional
 
 import sonication
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+FRONTEND_DIR = Path(__file__).parent / "frontend"
 
 PIZZA_SYSTEM_PROMPT = """You are Marco, the friendly pizza ordering assistant.
 
@@ -50,6 +56,10 @@ class PizzaAgent:
         llm_url: str = "http://localhost:8093",
         tts_url: str = "http://localhost:8094",
     ):
+        self.stt_url = stt_url
+        self.llm_url = llm_url
+        self.tts_url = tts_url
+
         # Create nodes
         self.stt_node = sonication.STTNode(stt_url)
         self.llm_node = sonication.LLMNode(
@@ -75,18 +85,31 @@ class PizzaAgent:
         await self.pipeline.warmup()
         logger.info("All nodes warm.")
 
-    async def run_turn(self, data: bytes) -> dict:
+    async def run_turn(self, audio_bytes: bytes) -> dict:
         """Process one turn (audio input) and return results."""
         self.turn_count += 1
         logger.info(f"Processing turn {self.turn_count}...")
 
-        result = await self.pipeline.turn("stt", data)
+        result = await self.pipeline.turn("stt", audio_bytes)
+
+        # Build analysis segments from the turn
+        try:
+            last_turn = self.pipeline._last_turn
+            if last_turn:
+                analysis = last_turn.analyse()
+                segments = [
+                    {"stage": s.stage_name, "ms": s.ms, "kind": s.kind}
+                    for s in analysis.segments
+                ]
+        except Exception:
+            segments = []
 
         return {
             "turn_index": self.turn_count,
             "stt_text": result.get("stt_text", ""),
             "llm_response": result.get("llm_response", ""),
             "shot_latency_ms": result.get("shot_latency_ms", 0),
+            "segments": segments,
         }
 
     def get_stats(self) -> dict:
@@ -99,10 +122,11 @@ class PizzaAgent:
 
 
 # ============================================================
-# WebSocket Server
+# FastAPI App
 # ============================================================
 
 app = FastAPI(title="Pizza Agent", version="0.2.0")
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 pizza_agent: Optional[PizzaAgent] = None
 
 
@@ -115,6 +139,11 @@ async def startup():
     logger.info("Pizza agent ready!")
 
 
+@app.get("/", response_class=FileResponse, include_in_schema=False)
+async def index():
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """WebSocket endpoint for live pizza ordering conversation."""
@@ -123,25 +152,19 @@ async def websocket_endpoint(ws: WebSocket):
 
     await ws.send_json({
         "type": "system",
-        "message": "Welcome to Marco's Pizza! Hold Enter to speak, release to send.",
+        "message": "Welcome to Marco's Pizza! Hold Enter to speak.",
     })
 
     try:
         while True:
             data = await ws.receive_json()
             msg_type = data.get("type", "")
-            content = data.get("content", "")
 
-            if msg_type == "audio":
-                audio_bytes = base64.b64decode(content)
+            if msg_type == "user_audio":
+                audio_b64 = data.get("audio_b64", "")
+                audio_bytes = base64.b64decode(audio_b64)
                 result = await pizza_agent.run_turn(audio_bytes)
-                await ws.send_json({
-                    "type": "response",
-                    "turn_index": result["turn_index"],
-                    "stt_text": result["stt_text"],
-                    "llm_response": result["llm_response"],
-                    "shot_latency_ms": result["shot_latency_ms"],
-                })
+                await ws.send_json(result)
 
             elif msg_type == "stats":
                 await ws.send_json({
@@ -154,202 +177,6 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await ws.send_json({"type": "error", "message": str(e)})
-
-
-@app.get("/")
-async def index():
-    """Simple HTML page for testing the WebSocket connection."""
-    return HTMLResponse(
-        content="""<!DOCTYPE html>
-<html>
-<head>
-    <title>Pizza Agent</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #fafafa; }
-        h1 { text-align: center; margin-bottom: 5px; }
-        .subtitle { text-align: center; color: #888; margin-bottom: 20px; }
-        #output { max-height: 50vh; overflow-y: auto; margin-bottom: 20px; }
-        .message { padding: 10px 14px; margin: 6px 0; border-radius: 12px; line-height: 1.4; }
-        .user { background: #dbeafe; margin-left: 30%; }
-        .agent { background: #dcfce7; margin-right: 30%; }
-        .system { background: #f3e8ff; text-align: center; font-size: 0.85em; }
-        .error { background: #fee2e2; color: #991b1b; }
-        .latency { font-size: 0.75em; color: #999; margin-top: 2px; }
-        #controls { display: flex; flex-direction: column; align-items: center; gap: 10px; }
-        #mic-btn {
-            width: 80px; height: 80px; border-radius: 50%; border: none;
-            background: #e5e7eb; cursor: pointer; font-size: 28px;
-            transition: all 0.15s; outline: none; user-select: none;
-            display: flex; align-items: center; justify-content: center;
-        }
-        #mic-btn.recording { background: #ef4444; transform: scale(1.1); }
-        #mic-btn:active { transform: scale(0.95); }
-        .hint { color: #666; font-size: 0.85em; }
-        #status { font-size: 0.8em; color: #999; height: 18px; }
-        button.stats { padding: 6px 16px; border: 1px solid #ccc; background: white; border-radius: 6px; cursor: pointer; font-size: 0.85em; }
-    </style>
-</head>
-<body>
-    <h1>Marco's Pizza</h1>
-    <p class="subtitle">Hold the mic button to speak, release to send</p>
-    <div id="output"></div>
-    <div id="controls">
-        <div id="status"></div>
-        <button id="mic-btn" onmousedown="startRecord()" onmouseup="stopRecord()" ontouchstart="startRecord()" ontouchend="stopRecord()">🎤</button>
-        <p class="hint">Hold to record • Release to send</p>
-        <button class="stats" onclick="getStats()">Stats</button>
-    </div>
-
-    <script>
-        let ws = new WebSocket('ws://localhost:8000/ws');
-        const output = document.getElementById('output');
-        const micBtn = document.getElementById('mic-btn');
-        const status = document.getElementById('status');
-        let mediaRecorder, chunks = [];
-        let isRecording = false;
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === 'system') {
-                addMessage(data.message, 'system');
-            } else if (data.type === 'response') {
-                addMessage(data.stt_text || '(audio)', 'user');
-                addMessage(data.llm_response, 'agent');
-                if (data.shot_latency_ms) {
-                    const lat = document.createElement('div');
-                    lat.className = 'latency';
-                    lat.textContent = data.shot_latency_ms + 'ms latency';
-                    output.appendChild(lat);
-                }
-                speak(data.llm_response);
-            } else if (data.type === 'stats') {
-                addMessage('Turns: ' + data.turn_count + ' | Nodes: ' + data.nodes.join(', '), 'system');
-            } else if (data.type === 'error') {
-                addMessage(data.message, 'error');
-            }
-        };
-
-        function addMessage(text, cls) {
-            const div = document.createElement('div');
-            div.className = 'message ' + cls;
-            div.textContent = text;
-            output.appendChild(div);
-            output.scrollTop = output.scrollHeight;
-        }
-
-        function speak(text) {
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.cancel();
-                const u = new SpeechSynthesisUtterance(text);
-                u.rate = 1.0;
-                u.pitch = 1.0;
-                window.speechSynthesis.speak(u);
-            }
-        }
-
-        async function startRecord() {
-            if (isRecording) return;
-            micBtn.classList.add('recording');
-            status.textContent = 'Recording...';
-
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-                chunks = [];
-                mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-                mediaRecorder.onstop = () => sendAudio(stream);
-                mediaRecorder.start(100);
-            } catch (err) {
-                status.textContent = 'Mic error: ' + err.message;
-                micBtn.classList.remove('recording');
-            }
-            isRecording = true;
-        }
-
-        function stopRecord() {
-            if (!isRecording) return;
-            isRecording = false;
-            micBtn.classList.remove('recording');
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-                mediaRecorder.stop();
-            }
-        }
-
-        async function sendAudio(stream) {
-            status.textContent = 'Processing...';
-            const blob = new Blob(chunks, { type: 'audio/webm' });
-            try {
-                const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                const decoded = await audioCtx.decodeAudioData(await blob.arrayBuffer());
-                const wav = audioBufferToWav(decoded);
-                ws.send(JSON.stringify({ type: 'audio', content: arrayBufferToBase64(wav) }));
-                await audioCtx.close();
-            } catch (err) {
-                status.textContent = 'Audio error: ' + err.message;
-                return;
-            }
-            status.textContent = 'Listening...';
-            stream.getTracks().forEach(t => t.stop());
-        }
-
-        function audioBufferToWav(buffer) {
-            const numChannels = buffer.numberOfChannels;
-            const sampleRate = buffer.sampleRate;
-            const format = 1;
-            const bitDepth = 16;
-            const bytesPerSample = bitDepth / 8;
-            const blockAlign = numChannels * bytesPerSample;
-            const data = [];
-            for (let c = 0; c < numChannels; c++) data.push(buffer.getChannelData(c));
-            const outputLength = 44 + data[0].length * blockAlign;
-            const output = new Uint8Array(outputLength);
-            const view = new DataView(output);
-            writeString(view, 0, 'RIFF');
-            view.setUint32(4, outputLength - 8, true);
-            writeString(view, 8, 'WAVE');
-            writeString(view, 12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, format, true);
-            view.setUint16(22, numChannels, true);
-            view.setUint32(24, sampleRate, true);
-            view.setUint32(28, sampleRate * blockAlign, true);
-            view.setUint16(32, blockAlign, true);
-            view.setUint16(34, bitDepth, true);
-            writeString(view, 36, 'data');
-            view.setUint32(40, data[0].length * blockAlign, true);
-            let offset = 44;
-            for (let i = 0; i < data[0].length; i++) {
-                for (let c = 0; c < numChannels; c++) {
-                    const sample = Math.max(-1, Math.min(1, data[c][i]));
-                    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
-                    offset += 2;
-                }
-            }
-            return output;
-        }
-
-        function writeString(view, offset, str) {
-            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-        }
-
-        function arrayBufferToBase64(buffer) {
-            let binary = '';
-            const bytes = new Uint8Array(buffer);
-            const chunkSize = 8192;
-            for (let i = 0; i < bytes.length; i += chunkSize) {
-                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-            }
-            return btoa(binary);
-        }
-
-        function getStats() {
-            ws.send(JSON.stringify({ type: 'stats' }));
-        }
-    </script>
-</body>
-</html>"""
-    )
 
 
 @app.get("/stats")
