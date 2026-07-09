@@ -7,17 +7,34 @@ unreachable, so a discovery failure never takes the server down.
 """
 from typing import Optional
 
-from . import clients, config
+import httpx
+
+from . import client, config
 
 
-async def _first_model(base_url: str, api_key: str) -> tuple[Optional[str], Optional[int]]:
-    resp = await clients.get_client().get(
-        f"{base_url}/v1/models", headers=config.bearer(api_key))
-    resp.raise_for_status()
-    data = (resp.json() or {}).get("data") or []
-    if not data:
-        return None, None
-    return data[0].get("id"), data[0].get("max_model_len")
+async def _first_model(base_url: str, api_key: str,
+                       http_client: Optional[httpx.AsyncClient] = None
+                       ) -> tuple[Optional[str], Optional[int]]:
+    """Query /v1/models and return (first_model_id, max_model_len).
+
+    Args:
+        base_url: Service base URL.
+        api_key: API key for auth.
+        http_client: Optional httpx.AsyncClient. If None, a temporary client
+                     is created and closed after this call.
+    """
+    c, close_after = client._make_client(http_client)
+    try:
+        resp = await c.get(
+            f"{base_url}/v1/models", headers=config.bearer(api_key))
+        resp.raise_for_status()
+        data = (resp.json() or {}).get("data") or []
+        if not data:
+            return None, None
+        return data[0].get("id"), data[0].get("max_model_len")
+    finally:
+        if close_after:
+            await c.aclose()
 
 
 async def discover() -> dict:

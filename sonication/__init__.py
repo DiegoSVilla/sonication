@@ -33,18 +33,20 @@ __version__ = VERSION
 from .events import (
     PipeEvent, EventRecorder, CallClock, CALL_START, CALL_END,
     NodeEvent, InterStageEvent, PhaseBoundary, NodeStageRecord,
+    PhaseGate, EventStream, StageBoundaries, Turn,
 )
 from .nodes import Node, STTNode, LLMNode, TTSNode
-from .hotpipe import HotPipe, Turn, StageBoundaries
+from .hotpipe import HotPipe, PingLoop
 from .pipeline import CallPipeline
 from .node_types import NodeConfigLabel, PipelineType, get_inter_stage_event
 from .analysis import (
     LatencyAnalyser, PipelineAnalysis, AnalysisSegment, _PIPELINE_SEGMENTS,
 )
+from .log_manager import LogManager
 from .db import (
     init_db, log_pipe_event, log_node_event,
-    insert_inter_stage_event, log_keep_warm_ping, log_node_stage,
-    get_node_stages, get_inter_stage_events, get_keep_warm_pings,
+    log_keep_warm_ping, log_node_stage,
+    get_node_stages, get_keep_warm_pings,
 )
 from .config import (
     LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_TEMPERATURE, LLM_SEED,
@@ -55,15 +57,17 @@ from .config import (
 
 __all__ = [
     'Node', 'STTNode', 'LLMNode', 'TTSNode', 'PipeEvent',
-    'HotPipe', 'Turn', 'StageBoundaries',
+    'HotPipe', 'PingLoop', 'Turn', 'StageBoundaries',
     'EventRecorder', 'CallClock', 'CallPipeline',
     'NodeConfigLabel', 'PipelineType', 'get_inter_stage_event',
     'NodeEvent', 'InterStageEvent', 'PhaseBoundary', 'NodeStageRecord',
+    'PhaseGate', 'EventStream',
     'LatencyAnalyser', 'PipelineAnalysis', 'AnalysisSegment', '_PIPELINE_SEGMENTS',
     'CALL_START', 'CALL_END',
+    'LogManager',
     'init_db', 'log_pipe_event', 'log_node_event',
-    'insert_inter_stage_event', 'log_keep_warm_ping', 'log_node_stage',
-    'get_node_stages', 'get_inter_stage_events', 'get_keep_warm_pings',
+    'log_keep_warm_ping', 'log_node_stage',
+    'get_node_stages', 'get_keep_warm_pings',
     'LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'LLM_TEMPERATURE', 'LLM_SEED',
     'LLM_MAX_TOKENS', 'TTS_BASE_URL', 'TTS_VOICE', 'TTS_LANGUAGE', 'TTS_MODEL',
     'STT_BASE_URL', 'STT_MODEL', 'STT_LANGUAGE', 'STT_API_KEY',

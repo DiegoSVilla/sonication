@@ -65,7 +65,7 @@ class VoiceChannel:
         except Exception:
             pass  # client disconnected
         finally:
-            self.call.end()
+            await self.call.end()
 
 
 app = FastAPI(

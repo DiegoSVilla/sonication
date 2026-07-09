@@ -20,7 +20,7 @@ from typing import AsyncIterator, Optional
 
 import httpx
 
-from . import clients
+from . import client
 from . import config
 from .node_types import NodeConfigLabel
 
@@ -44,21 +44,25 @@ class Node:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.db = db
+        self.log_manager = None  # set by HotPipe.connect()
         self.connection: httpx.AsyncClient = None
         self.is_warm: bool = False
         self._stage_id: Optional[str] = None
 
     def _auth_headers(self) -> dict:
         """Build auth headers from api_key."""
-        return clients.config.bearer(self.api_key) if self.api_key else {}
+        return config.bearer(self.api_key) if self.api_key else {}
 
     async def warmup(self, timeout: float = 5.0) -> bool:
         """Establish keepalive connection via /ping."""
         if not self.connection:
-            self.connection = httpx.AsyncClient(timeout=clients._timeout, limits=clients._limits)
+            self.connection = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+                limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60.0)
+            )
         try:
             resp = await asyncio.wait_for(
-                self.connection.get(f"{self.base_url}/ping"),
+                self.connection.get(f"{self.base_url}/ping", headers=self._auth_headers()),
                 timeout=timeout,
             )
             if resp.status_code == 200:
@@ -110,31 +114,79 @@ class Node:
 
 
 class STTNode(Node):
-    """Speech-to-Text. Accepts PCM bytes, yields transcript."""
+    """Speech-to-Text. Accepts audio bytes, yields transcript.
+
+    Args:
+        base_url: STT endpoint URL.
+        api_key: Optional API key.
+        db: Optional database for logging.
+        sample_rate: Sample rate for PCM wrapping (ignored if input_format="wav").
+        input_format: Format of incoming audio bytes.
+            "wav" — WAV with header, pass through directly (browser default).
+            "pcm" — Raw 16-bit PCM, wrapped in WAV with sample_rate.
+            "flac" — FLAC bytes, passed through directly.
+            Defaults to "wav" to match browser encoder output.
+    """
 
     _config_label = NodeConfigLabel.STT_NON_STREAMING
 
-    def __init__(self, base_url: str, api_key: str = "", db=None):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        db=None,
+        sample_rate: int = 16000,
+        input_format: str = "wav",
+    ):
         super().__init__(base_url, api_key, db)
+        self.sample_rate = sample_rate
+        self.input_format = input_format.lower()
 
     def route(self) -> str:
         return "/v1/audio/transcriptions"
 
     async def stream(self, audio_bytes: bytes, language: str = None) -> AsyncIterator[dict]:
-        """Transcribe PCM audio. Converts to WAV internally."""
+        """Transcribe audio. Handles different input formats configured at init."""
         try:
-            wav_buf = io.BytesIO()
-            with wave.open(wav_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(config.AUDIO_SAMPLE_RATE)
-                wf.writeframes(audio_bytes)
-            wav_bytes = wav_buf.getvalue()
+            fmt = self.input_format
+            lang = language or config.STT_LANGUAGE
 
-            result = await clients.transcribe(wav_bytes, filename="audio.wav", language=language)
+            if fmt == "wav":
+                # Already WAV — pass through directly (like minimalVoice)
+                is_wav = audio_bytes[:4] == b'RIFF'
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes, is_wav={is_wav}, sample_rate_hint={int.from_bytes(audio_bytes[24:28], 'little') if len(audio_bytes) >= 28 else '?'}")
+                if not is_wav:
+                    logger.warning(f"STTNode.stream: WAV format but no RIFF header! First 8 bytes: {audio_bytes[:8].hex()}")
+                result = await client.transcribe(audio_bytes, filename="audio.wav",
+                                                    content_type="audio/wav", language=lang,
+                                                    client=self.connection)
+
+            elif fmt == "pcm":
+                # Raw 16-bit PCM — wrap in WAV with configured sample_rate
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes PCM → WAV")
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes(audio_bytes)
+                wav_bytes = wav_buf.getvalue()
+                result = await client.transcribe(wav_bytes, filename="audio.wav",
+                                                    content_type="audio/wav", language=lang,
+                                                    client=self.connection)
+
+            elif fmt == "flac":
+                logger.info(f"STTNode.stream: {len(audio_bytes)} bytes FLAC")
+                result = await client.transcribe(audio_bytes, filename="audio.flac",
+                                                    content_type="audio/flac", language=lang,
+                                                    client=self.connection)
+
+            else:
+                raise ValueError(f"STTNode: unsupported input_format='{fmt}'. Use 'wav', 'pcm', or 'flac'.")
+
             text = result.get("text", "")
-            yield {"kind": "transcript", "text": text, "usage": result.get("usage", {})}
-            yield {"kind": "done", "text": text}
+            logger.info(f"STT result: text='{text}', raw={result}")
+            yield {"kind": "done", "text": text, "usage": result.get("usage", {})}
 
         except Exception as e:
             logger.error(f"STT failed: {e}")
@@ -212,12 +264,13 @@ class LLMNode(Node):
         if len(self._history) > self.max_history:
             self._history = [self._history[0]] + self._history[-(self.max_history - 1):]
 
-        async for chunk in clients.stream_llm(
+        async for chunk in client.stream_llm(
             self._history,
             seed=kwargs.get("seed", config.LLM_SEED),
             temperature=kwargs.get("temperature", config.LLM_TEMPERATURE),
             max_tokens=kwargs.get("max_tokens", config.LLM_MAX_TOKENS),
             enable_thinking=kwargs.get("enable_thinking", config.LLM_ENABLE_THINKING),
+            client=self.connection,
         ):
             yield chunk
 
@@ -240,5 +293,5 @@ class TTSNode(Node):
         """Stream audio chunks."""
         voice = voice or self.voice
         language = language or self.language
-        async for chunk in clients.stream_tts(text, voice, language):
+        async for chunk in client.stream_tts(text, voice, language, client=self.connection):
             yield chunk

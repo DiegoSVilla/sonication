@@ -6,10 +6,11 @@ Audio is kept in order by draining phrases through a single sequential TTS
 consumer, which matches how the audio must be spoken on the channel anyway.
 """
 import asyncio
+import httpx
 import json
 from typing import Any, Awaitable, Callable, Optional
 
-from . import clients, config, db, events
+from . import client, config, db, events
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -36,12 +37,20 @@ class CallPipeline:
         self.call_id = call_id
         self.rec = recorder
         self.send = send
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60.0)
+        )
         self.history: list[dict[str, str]] = [
             {"role": "system", "content": config.SYSTEM_PROMPT}
         ]
         self.turn_index = 0
         # Cumulative audio produced across the whole call (ms of speech).
         self.call_audio_ms = 0.0
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        await self._client.aclose()
 
     async def _emit(self, msg: dict[str, Any]) -> None:
         if self.send is not None:
@@ -76,7 +85,8 @@ class CallPipeline:
 
         stt_start = self.rec.clock.now_ms()
         try:
-            result = await clients.transcribe(audio, language=config.STT_LANGUAGE or None)
+            result = await client.transcribe(audio, language=config.STT_LANGUAGE or None,
+                                            client=self._client)
         except Exception as exc:
             await self._emit({"type": "error", "message": f"STT failed: {exc}"})
             return {"turn_id": turn_id, "assistant_text": "", "metrics": {}}
@@ -228,12 +238,13 @@ class CallPipeline:
         buf = ""
         last_content_t = start_t
 
-        async for chunk in clients.stream_llm(
+        async for chunk in client.stream_llm(
             messages=self.history,
             seed=config.LLM_SEED,
             temperature=config.LLM_TEMPERATURE,
             max_tokens=config.LLM_MAX_TOKENS,
             enable_thinking=config.LLM_ENABLE_THINKING,
+            client=self._client,
         ):
             if chunk["kind"] == "token":
                 now = self.rec.clock.now_ms()
@@ -347,7 +358,8 @@ class CallPipeline:
         phrase_audio_ms = 0.0
         usage: dict[str, Any] = {}
 
-        async for chunk in clients.stream_tts(text, config.TTS_VOICE, config.TTS_LANGUAGE):
+        async for chunk in client.stream_tts(text, config.TTS_VOICE, config.TTS_LANGUAGE,
+                                               client=self._client):
             if chunk["kind"] == "audio":
                 now = self.rec.clock.now_ms()
                 pcm = chunk["pcm"]

@@ -10,12 +10,24 @@ the analysis space can query them without replaying every event.
 import json
 import sqlite3
 import threading
+import time
 from typing import Any, Optional
 
 from . import config
 
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
+
+def _retry(fn, retries=3, delay=0.1):
+    """Retry a DB operation on 'database is locked' errors."""
+    for i in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and i < retries - 1:
+                time.sleep(delay * (2 ** i))
+            else:
+                raise
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -101,34 +113,19 @@ CREATE TABLE IF NOT EXISTS node_stages (
     FOREIGN KEY(turn_id) REFERENCES turns(id)
 );
 
--- Pipe events (extended)
+-- Pipe events (unified)
 CREATE TABLE IF NOT EXISTS pipe_events (
     event_id                  TEXT PRIMARY KEY,
-    type                      TEXT,
-    node_name                 TEXT,
-    turn_id                   TEXT,
+    event_type                TEXT NOT NULL,
+    node_name                 TEXT NOT NULL,
+    emitter_type              TEXT NOT NULL,
+    turn_id                   TEXT NOT NULL,
     timestamp_wallclock_ms    REAL,
     timestamp_local_offset    REAL,
     payload_json              TEXT,
     parent_event_id           TEXT,
     stage_id                  TEXT,
     seq                       INTEGER
-);
-
--- Inter-stage events
-CREATE TABLE IF NOT EXISTS inter_stage_events (
-    event_id            TEXT PRIMARY KEY,
-    turn_id             TEXT NOT NULL,
-    session_id          TEXT,
-    conversation_id     TEXT,
-    event_type          TEXT NOT NULL,
-    wallclock_ms        REAL NOT NULL,
-    local_offset_ms     REAL,
-    seq                 INTEGER,
-    from_stage_id       TEXT,
-    to_stage_id         TEXT,
-    payload_json        TEXT NOT NULL,
-    UNIQUE(turn_id, seq)
 );
 
 -- Keep-alive pings
@@ -143,7 +140,7 @@ CREATE TABLE IF NOT EXISTS keep_warm_pings (
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_pipe_events_stage ON pipe_events(stage_id);
-CREATE INDEX IF NOT EXISTS idx_inter_stage_turn ON inter_stage_events(turn_id, seq);
+CREATE INDEX IF NOT EXISTS idx_pipe_events_type ON pipe_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_node_stages_turn ON node_stages(turn_id);
 CREATE INDEX IF NOT EXISTS idx_node_stages_config ON node_stages(config_label);
 """
@@ -175,6 +172,16 @@ def get_conn() -> sqlite3.Connection:
                 _conn.execute(f"ALTER TABLE pipe_events ADD COLUMN {col} {coltype}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Migrate pipe_events for unified event format
+        try:
+            _conn.execute("ALTER TABLE pipe_events ADD COLUMN emitter_type TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Drop inter_stage_events table (merged into pipe_events)
+        try:
+            _conn.execute("DROP TABLE IF EXISTS inter_stage_events")
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist
         _conn.commit()
     return _conn
 
@@ -264,19 +271,21 @@ def save_session_state(
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO session_state"
-            "(session_id, history_json, message_count, last_call_id, updated_iso, updated_epoch_ms) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "history_json=excluded.history_json, message_count=excluded.message_count, "
-            "last_call_id=excluded.last_call_id, updated_iso=excluded.updated_iso, "
-            "updated_epoch_ms=excluded.updated_epoch_ms",
-            (session_id, json.dumps(history), len(history), last_call_id,
-             now.isoformat(), now.timestamp() * 1000.0),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO session_state"
+                "(session_id, history_json, message_count, last_call_id, updated_iso, updated_epoch_ms) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "history_json=excluded.history_json, message_count=excluded.message_count, "
+                "last_call_id=excluded.last_call_id, updated_iso=excluded.updated_iso, "
+                "updated_epoch_ms=excluded.updated_epoch_ms",
+                (session_id, json.dumps(history), len(history), last_call_id,
+                 now.isoformat(), now.timestamp() * 1000.0),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 def load_session_state(session_id: str) -> Optional[list[dict[str, Any]]]:
@@ -289,44 +298,57 @@ def load_session_state(session_id: str) -> Optional[list[dict[str, Any]]]:
 
 def insert_event(event: dict[str, Any]) -> None:
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO events(seq, call_id, turn_id, type, t_ms, payload_json) "
-            "VALUES (?,?,?,?,?,?)",
-            (
-                event["seq"],
-                event["call_id"],
-                event["turn_id"],
-                event["type"],
-                event["t_ms"],
-                json.dumps(event["payload"]),
-            ),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO events(seq, call_id, turn_id, type, t_ms, payload_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    event["seq"],
+                    event["call_id"],
+                    event["turn_id"],
+                    event["type"],
+                    event["t_ms"],
+                    json.dumps(event["payload"]),
+                ),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 def log_pipe_event(event: dict[str, Any]) -> None:
+    """Log a unified event to pipe_events table.
+    
+    Accepts unified event format:
+        event_type: "start", "chunk", "token", "response", "done", "usage", "error"
+        node_name: "stt", "llm", "tts", "phrase_gate"
+        emitter_type: "STT_NON_STREAMING", "LLM_STREAMING", etc.
+    """
     conn = get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO pipe_events "
-            "(event_id, type, node_name, turn_id, timestamp_wallclock_ms, "
-            "timestamp_local_offset, payload_json, parent_event_id, stage_id, seq) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                event["event_id"],
-                event["type"],
-                event["node_name"],
-                event["turn_id"],
-                event["timestamp_wallclock_ms"],
-                event["timestamp_local_offset"],
-                json.dumps(event["payload"]),
-                event.get("parent_event_id"),
-                event.get("stage_id"),
-                event.get("seq"),
-            ),
-        )
-        conn.commit()
+    def _do():
+        with _lock:
+            conn.execute(
+                "INSERT INTO pipe_events "
+                "(event_id, event_type, node_name, emitter_type, turn_id, "
+                "timestamp_wallclock_ms, timestamp_local_offset, payload_json, "
+                "parent_event_id, stage_id, seq) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event["event_id"],
+                    event["event_type"],
+                    event["node_name"],
+                    event.get("emitter_type", ""),
+                    event["turn_id"],
+                    event["timestamp_wallclock_ms"],
+                    event["timestamp_local_offset"],
+                    json.dumps(event["payload"]),
+                    event.get("parent_event_id"),
+                    event.get("stage_id"),
+                    event.get("seq"),
+                ),
+            )
+            conn.commit()
+    _retry(_do)
 
 
 # ---- read helpers for the analysis space and JSON export ----
@@ -369,19 +391,23 @@ def get_events(call_id: str) -> list[dict[str, Any]]:
 
 
 def log_node_event(event: dict[str, Any]) -> None:
-    """Save a NodeEvent to the pipe_events table with stage_id and seq."""
+    """Save a NodeEvent to the pipe_events table with stage_id and seq.
+    
+    Accepts unified event format with backward-compatible aliases.
+    """
     conn = get_conn()
     with _lock:
         conn.execute(
             """
-            INSERT INTO pipe_events(event_id, type, node_name, turn_id, timestamp_wallclock_ms,
+            INSERT INTO pipe_events(event_id, event_type, node_name, emitter_type, turn_id, timestamp_wallclock_ms,
                                     timestamp_local_offset, payload_json, parent_event_id, stage_id, seq)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.get("event_id"),
                 event.get("event_type") or event.get("type"),
                 event.get("node_name"),
+                event.get("emitter_type", ""),
                 event.get("turn_id"),
                 event.get("wallclock_ms") or event.get("timestamp_wallclock_ms"),
                 event.get("local_offset_ms") or event.get("timestamp_local_offset"),
@@ -389,34 +415,6 @@ def log_node_event(event: dict[str, Any]) -> None:
                 event.get("parent_event_id"),
                 event.get("stage_id"),
                 event.get("seq"),
-            ),
-        )
-        conn.commit()
-
-
-def insert_inter_stage_event(event: dict[str, Any]) -> None:
-    """Save an InterStageEvent to the inter_stage_events table."""
-    conn = get_conn()
-    with _lock:
-        conn.execute(
-            """
-            INSERT INTO inter_stage_events(event_id, turn_id, session_id, conversation_id,
-                                          event_type, wallclock_ms, local_offset_ms, seq,
-                                          from_stage_id, to_stage_id, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.get("event_id"),
-                event.get("turn_id"),
-                event.get("session_id"),
-                event.get("conversation_id"),
-                event.get("event_type"),
-                event.get("wallclock_ms"),
-                event.get("local_offset_ms"),
-                event.get("seq"),
-                event.get("from_stage_id"),
-                event.get("to_stage_id"),
-                json.dumps(event.get("payload", {})),
             ),
         )
         conn.commit()
@@ -474,14 +472,6 @@ def get_node_stages(turn_id: str) -> list[dict[str, Any]]:
     """Return all stage records for a turn."""
     return _rows(
         "SELECT * FROM node_stages WHERE turn_id=? ORDER BY start_wall_ms",
-        (turn_id,),
-    )
-
-
-def get_inter_stage_events(turn_id: str) -> list[dict[str, Any]]:
-    """Return all inter-stage events for a turn."""
-    return _rows(
-        "SELECT * FROM inter_stage_events WHERE turn_id=? ORDER BY seq",
         (turn_id,),
     )
 
