@@ -68,7 +68,6 @@ function bubbleAppend(role, text) {
   // If this is a new turn, start a fresh assistant bubble
   if (role !== "assistant" || !lastAssistantBubble || currentTurnIndex === null) {
     lastAssistantBubble = bubble(role, text);
-    currentTurnIndex = null;
     return lastAssistantBubble;
   }
   // Append to the existing assistant bubble for streaming
@@ -217,7 +216,7 @@ function handle(msg) {
       bubbleSystem(msg.message);
       break;
     case "stt_done":
-      // STT transcript ready — show as user bubble
+      // STT transcript ready — show as user bubble, reset assistant bubble for new turn
       currentTurnIndex = msg.turn_index;
       lastAssistantBubble = null;
       bubble("user", msg.text || "(no speech detected)");
@@ -246,7 +245,7 @@ function handle(msg) {
       }
       break;
     case "audio_out":
-      ttsPlayCursor = audioCtx ? audioCtx.currentTime : 0;
+      // Play audio phrase as soon as it's ready (first bite principle)
       playTtsChunk(msg);
       break;
     case "channel_playback_start":

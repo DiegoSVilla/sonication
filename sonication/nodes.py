@@ -186,8 +186,7 @@ class STTNode(Node):
 
             text = result.get("text", "")
             logger.info(f"STT result: text='{text}', raw={result}")
-            yield {"kind": "transcript", "text": text, "usage": result.get("usage", {})}
-            yield {"kind": "done", "text": text}
+            yield {"kind": "done", "text": text, "usage": result.get("usage", {})}
 
         except Exception as e:
             logger.error(f"STT failed: {e}")

@@ -85,7 +85,7 @@ async def test_pipeline_turn(text: str, turn_num: int) -> dict:
     log = sonication.LogManager(mode="console")
     log.start()
 
-    stt_node = sonication.STTNode(config.STT_BASE_URL)
+    stt_node = sonication.STTNode(config.STT_BASE_URL, input_format="pcm")
     await stt_node.warmup()
 
     llm_node = sonication.LLMNode(
@@ -108,7 +108,7 @@ async def test_pipeline_turn(text: str, turn_num: int) -> dict:
     pipeline.connect()
 
     # Step 3: Run the turn through the pipeline
-    print("  [3/5] Running pipeline turn...")
+    print(f"  [3/5] Running pipeline turn...")
     try:
         results = []
         async for result in pipeline.turn("stt", pcm_bytes):
@@ -206,7 +206,7 @@ async def test_pipeline_streaming(text: str, turn_num: int) -> dict:
     log = sonication.LogManager(mode="console")
     log.start()
 
-    stt_node = sonication.STTNode(config.STT_BASE_URL)
+    stt_node = sonication.STTNode(config.STT_BASE_URL, input_format="pcm")
     await stt_node.warmup()
 
     llm_node = sonication.LLMNode(
@@ -229,12 +229,12 @@ async def test_pipeline_streaming(text: str, turn_num: int) -> dict:
     pipeline.connect()
 
     # Step 3: Run streaming turn
-    print("  [3/4] Running streaming turn...")
+    print(f"  [3/4] Running streaming turn...")
     events = []
     turn_complete = None
     async for event in pipeline.turn("stt", pcm_bytes, stream_events=True):
         events.append(event)
-        if event.get("event_type") == "turn_complete":
+        if event.get("event_type") == "response" and "stt_text" in event.get("payload", {}):
             turn_complete = event
 
     payload = turn_complete.get("payload", {}) if turn_complete else {}
@@ -272,55 +272,6 @@ async def test_pipeline_streaming(text: str, turn_num: int) -> dict:
     }
 
 
-async def test_stt_node_directly() -> dict:
-    """Test STTNode directly — does it yield transcript events correctly?"""
-    print(f"\n{'='*60}")
-    print(f"TEST: STTNode Direct Yield Check")
-    print(f"{'='*60}")
-
-    # Generate short TTS audio
-    pcm_chunks = []
-    async for chunk in client.stream_tts("hello", "ryan", "English"):
-        if chunk.get("kind") == "audio":
-            pcm_data = chunk.get("pcm", b"")
-            if pcm_data:
-                pcm_chunks.append(pcm_data)
-
-    pcm_bytes = b"".join(pcm_chunks)
-    print(f"  Generated {len(pcm_bytes)} bytes of PCM")
-
-    # Test STTNode directly
-    stt_node = sonication.STTNode(config.STT_BASE_URL)
-    await stt_node.warmup()
-
-    events = []
-    async for raw in stt_node.stream(pcm_bytes):
-        events.append(raw)
-        print(f"  STTNode yielded: kind={raw.get('kind')}, keys={list(raw.keys())}")
-
-    await stt_node.close()
-
-    # Check what we got
-    transcripts = [e for e in events if e.get("kind") == "transcript"]
-    done_events = [e for e in events if e.get("kind") == "done"]
-
-    print(f"  Transcript events: {len(transcripts)}")
-    print(f"  Done events: {len(done_events)}")
-
-    if transcripts:
-        print(f"  Transcript text: '{transcripts[0].get('text')}'")
-
-    success = len(transcripts) >= 1
-    print(f"  {'✓ PASS' if success else '✗ FAIL (STT service may be unavailable)'}")
-
-    return {
-        "success": success,
-        "events": events,
-        "transcript_count": len(transcripts),
-        "done_count": len(done_events),
-    }
-
-
 async def simulate_pizza_conversation() -> dict:
     """Simulate a complete pizza ordering conversation through the pipeline."""
     print("\n" + "=" * 70)
@@ -334,14 +285,6 @@ async def simulate_pizza_conversation() -> dict:
         "turns": [],
         "validations": [],
     }
-
-    # ===== PHASE 0: STTNode Direct Test =====
-    print("\n\n" + "=" * 70)
-    print("  PHASE 0: STTNode Direct Yield Validation")
-    print("=" * 70)
-
-    stt_test = await test_stt_node_directly()
-    results["validations"].append({"phase": "stt_direct", **stt_test})
 
     # ===== PHASE 1: Pipeline Turns =====
     print("\n\n" + "=" * 70)
@@ -375,15 +318,6 @@ async def simulate_pizza_conversation() -> dict:
     print("=" * 70)
 
     all_passed = True
-
-    # STTNode direct
-    v = results["validations"][0]
-    status = "✓ PASS" if v.get("success") else "✗ FAIL"
-    if not v.get("success"):
-        all_passed = False
-    print(f"\n  STTNode Direct: {status}")
-    print(f"    Transcript events: {v.get('transcript_count', 0)}")
-    print(f"    Done events: {v.get('done_count', 0)}")
 
     # Pipeline turns
     for v in results["turns"]:

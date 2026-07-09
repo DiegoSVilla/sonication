@@ -112,7 +112,7 @@ class PizzaAgent:
             async for event in self.pipeline.turn("stt", audio_bytes, stream_events=True):
                 events.append(event)
                 logger.info(f"Event: {event.get('event_type')} ({event.get('emitter_node')}) @ {event.get('local_offset_ms', 0):.0f}ms")
-                if event.get("event_type") == "turn_complete":
+                if event.get("event_type") == "response" and "stt_text" in event.get("payload", {}):
                     turn_complete = event
             
             payload = turn_complete.get("payload", {}) if turn_complete else {}
@@ -173,9 +173,9 @@ class PizzaAgent:
             session_id: Session identifier.
             send_fn: Async callable to send each message (e.g., ws.send_json).
         """
-        self.turn_count += 1
-        logger.info(f"Processing turn {self.turn_count} [session={session_id}]...")
+        logger.info(f"Processing turn [session={session_id}]...")
         
+        self.turn_count += 1
         turn_index = self.turn_count
         llm_text = ""
         tts_audio_chunks = []
@@ -188,7 +188,7 @@ class PizzaAgent:
             emitter = event.get("emitter_node")
             payload = event.get("payload", {})
             
-            if event_type == "turn_complete":
+            if event_type == "response" and "stt_text" in payload:
                 # Extract final results from payload
                 stt_text = payload.get("stt_text", "")
                 llm_text = payload.get("llm_response", "")
@@ -211,8 +211,8 @@ class PizzaAgent:
                 break
             
             # Stream intermediate events
-            if emitter == "stt" and event_type == "done":
-                # STT done — send transcript
+            if emitter == "stt" and event_type == "response":
+                # STT response — send transcript
                 msg = {
                     "type": "stt_done",
                     "turn_index": turn_index,

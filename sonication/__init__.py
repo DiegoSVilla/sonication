@@ -33,9 +33,10 @@ __version__ = VERSION
 from .events import (
     PipeEvent, EventRecorder, CallClock, CALL_START, CALL_END,
     NodeEvent, InterStageEvent, PhaseBoundary, NodeStageRecord,
+    PhaseGate, EventStream, StageBoundaries, Turn,
 )
 from .nodes import Node, STTNode, LLMNode, TTSNode
-from .hotpipe import HotPipe, Turn, StageBoundaries
+from .hotpipe import HotPipe, PingLoop
 from .pipeline import CallPipeline
 from .node_types import NodeConfigLabel, PipelineType, get_inter_stage_event
 from .analysis import (
@@ -56,10 +57,11 @@ from .config import (
 
 __all__ = [
     'Node', 'STTNode', 'LLMNode', 'TTSNode', 'PipeEvent',
-    'HotPipe', 'Turn', 'StageBoundaries',
+    'HotPipe', 'PingLoop', 'Turn', 'StageBoundaries',
     'EventRecorder', 'CallClock', 'CallPipeline',
     'NodeConfigLabel', 'PipelineType', 'get_inter_stage_event',
     'NodeEvent', 'InterStageEvent', 'PhaseBoundary', 'NodeStageRecord',
+    'PhaseGate', 'EventStream',
     'LatencyAnalyser', 'PipelineAnalysis', 'AnalysisSegment', '_PIPELINE_SEGMENTS',
     'CALL_START', 'CALL_END',
     'LogManager',
